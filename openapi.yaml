@@ -1,0 +1,267 @@
+openapi: 3.0.3
+info:
+  title: OneGateway
+  version: "0.1.0"
+  description: |
+    聚合网关（示例版）：提供出行规划接口。默认 dry-run，只返回规划草案；
+    当 confirm=true 时可接入真实第三方数据源（后续扩展）。
+servers:
+  - url: http://localhost:8000
+    description: Local dev
+paths:
+  /v1/trip_plan:
+    post:
+      summary: 出行规划（dry-run 默认）
+      tags: [trip]
+      security:
+        - XApiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                origin:
+                  type: string
+                  description: 出发地
+                destination:
+                  type: string
+                  description: 目的地（可为空，表示本地游）
+                date_range:
+                  type: array
+                  description: 日期范围 [开始, 结束]，YYYY-MM-DD
+                  items:
+                    type: string
+                interests:
+                  type: array
+                  description: 兴趣偏好，如 kids, food, culture
+                  items:
+                    type: string
+                people_count:
+                  type: integer
+                budget_cny:
+                  type: integer
+                dry_run:
+                  type: boolean
+                  default: true
+                  description: 仅返回规划草案，不调用真实三方
+                confirm:
+                  type: boolean
+                  default: false
+                  description: 确认后才调用真实三方
+            example:
+              origin: 武汉
+              date_range: ["2025-11-21", "2025-11-22"]
+              interests: ["kids", "food"]
+              dry_run: true
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  mode:
+                    type: string
+                  summary:
+                    type: string
+                  inputs:
+                    $ref: '#/components/schemas/TripPlanRequest'
+                  itinerary:
+                    type: array
+                    items:
+                      type: string
+              example:
+                mode: dry-run
+                summary: 示例规划（尚未调用真实数据源）。确认后可接入地图/天气等第三方。
+                inputs:
+                  origin: 武汉
+                  date_range: ["2025-11-21", "2025-11-22"]
+                  interests: ["kids", "food"]
+                  dry_run: true
+                itinerary:
+                  - D1 上午：根据兴趣推荐 2-3 个亲子友好景点（示例）
+                  - D1 下午：就餐与休息安排（示例）
+                  - D2 上午：室内/室外活动备选（示例）
+                  - D2 下午：返程/自由活动（示例）
+  /v1/compare:
+    post:
+      summary: 购物比价（dry-run 默认）
+      tags: [compare]
+      security:
+        - XApiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CompareRequest'
+            example:
+              query: 婴童推车 可折叠 7kg 以下
+              max_results: 3
+              dry_run: true
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  mode:
+                    type: string
+                  summary:
+                    type: string
+                  inputs:
+                    $ref: '#/components/schemas/CompareRequest'
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/CompareItem'
+              example:
+                mode: dry-run
+                summary: 示例比价结果（未接三方）。确认后可接 JD/淘宝/拼多多 等数据源。
+                inputs:
+                  query: 婴童推车 可折叠 7kg 以下
+                  max_results: 3
+                  dry_run: true
+                items:
+                  - title: 示例款 轻便婴童推车 A
+                    price_cny: 499
+                    source: JD
+                    url: https://example.com/jd/a
+                  - title: 示例款 轻便婴童推车 B
+                    price_cny: 469
+                    source: Taobao
+                    url: https://example.com/tb/b
+  /v1/biz_insight:
+    post:
+      summary: 本地商业策略洞察（dry-run 默认）
+      tags: [biz]
+      security:
+        - XApiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BizInsightRequest'
+            example:
+              city: 武汉
+              industry: retail
+              dry_run: true
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  mode:
+                    type: string
+                  summary:
+                    type: string
+                  inputs:
+                    $ref: '#/components/schemas/BizInsightRequest'
+                  insights:
+                    type: array
+                    items:
+                      type: string
+                  actions:
+                    type: array
+                    items:
+                      type: string
+              example:
+                mode: dry-run
+                summary: 示例洞察（未接真实数据源）。确认后可接 POI/热度/竞品等数据。
+                inputs:
+                  city: 武汉
+                  industry: retail
+                  dry_run: true
+                insights:
+                  - 核心商圈周末亲子客流较高，上午 10-12 点达到峰值（示例）
+                actions:
+                  - 优先选择靠近地铁口的室内场地，便于家庭出行（示例）
+components:
+  securitySchemes:
+    XApiKey:
+      type: apiKey
+      in: header
+      name: X-Api-Key
+  schemas:
+    TripPlanRequest:
+      type: object
+      properties:
+        origin:
+          type: string
+        destination:
+          type: string
+        date_range:
+          type: array
+          items:
+            type: string
+        interests:
+          type: array
+          items:
+            type: string
+        people_count:
+          type: integer
+        budget_cny:
+          type: integer
+        dry_run:
+          type: boolean
+          default: true
+        confirm:
+          type: boolean
+          default: false
+    CompareRequest:
+      type: object
+      properties:
+        query:
+          type: string
+        max_results:
+          type: integer
+          minimum: 1
+          maximum: 20
+        dry_run:
+          type: boolean
+          default: true
+        confirm:
+          type: boolean
+          default: false
+    CompareItem:
+      type: object
+      properties:
+        title:
+          type: string
+        price_cny:
+          type: number
+          format: float
+        source:
+          type: string
+        url:
+          type: string
+    BizInsightRequest:
+      type: object
+      properties:
+        city:
+          type: string
+        industry:
+          type: string
+        area:
+          type: string
+        metrics:
+          type: array
+          items:
+            type: string
+        dry_run:
+          type: boolean
+          default: true
+        confirm:
+          type: boolean
+          default: false
+security:
+  - XApiKey: []
