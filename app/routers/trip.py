@@ -79,6 +79,22 @@ class Packages(BaseModel):
     tips: Optional[str] = None
 
 
+class ReverseGeocodeRequest(BaseModel):
+    lat: float = Field(..., description="Latitude (GCJ-02)")
+    lng: float = Field(..., description="Longitude (GCJ-02)")
+
+
+class ReverseGeocodeResponse(BaseModel):
+    city_name: Optional[str] = Field(None, description="城市名称，例如 武汉市")
+    province: Optional[str] = None
+    district: Optional[str] = None
+    adcode: Optional[str] = None
+    formatted_address: Optional[str] = None
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+    raw: Optional[Dict[str, Any]] = None  # 原始响应，可选
+
+
 class TripPlanResponse(BaseModel):
     mode: str
     summary: str
@@ -113,6 +129,55 @@ def _http_get_json(base_url: str, params: Dict[str, str], timeout: float = 5.0):
         return json.loads(data)
     except Exception:
         return None
+
+
+def _reverse_geocode_gaode(lat: float, lng: float) -> Optional[ReverseGeocodeResponse]:
+    """
+    使用高德逆地理编码接口将经纬度解析为城市/省份等信息。
+    文档示例：https://restapi.amap.com/v3/geocode/regeo
+    """
+    key = os.getenv("GAODE_KEY") or os.getenv("AMAP_KEY")
+    if not key:
+        return None
+
+    data = _http_get_json(
+        "https://restapi.amap.com/v3/geocode/regeo",
+        {
+            "key": key,
+            "location": f"{lng},{lat}",  # 高德要求：lng,lat
+            "radius": "1000",
+            "extensions": "base",
+        },
+        timeout=5.0,
+    )
+    if not data or data.get("status") != "1":
+        return None
+
+    regeocode = data.get("regeocode") or {}
+    comp = regeocode.get("addressComponent") or {}
+
+    city = comp.get("city")
+    # 直辖市等 city 可能是空字符串或列表
+    if isinstance(city, list):
+        city = city[0] if city else None
+    if not city:
+        city = comp.get("province")
+
+    province = comp.get("province")
+    district = comp.get("district")
+    adcode = comp.get("adcode")
+    formatted_address = regeocode.get("formatted_address")
+
+    return ReverseGeocodeResponse(
+        city_name=city,
+        province=province,
+        district=district,
+        adcode=adcode,
+        formatted_address=formatted_address,
+        lat=lat,
+        lng=lng,
+        raw=data,
+    )
 
 
 def _need_more_info(req: TripPlanRequest) -> List[str]:
@@ -567,3 +632,25 @@ def trip_plan(req: TripPlanRequest):
         packages=packages,
         debug=debug,
     )
+
+
+@router.post("/reverse_geocode", response_model=ReverseGeocodeResponse)
+def reverse_geocode(req: ReverseGeocodeRequest) -> ReverseGeocodeResponse:
+    """
+    小程序调用的逆地理编码接口。
+    输入 GCJ-02 坐标，返回城市名称等基础信息。
+    """
+    result = _reverse_geocode_gaode(req.lat, req.lng)
+    if result is None:
+        # 调用失败时也返回 200，只是字段为空，避免前端崩溃
+        return ReverseGeocodeResponse(
+            city_name=None,
+            province=None,
+            district=None,
+            adcode=None,
+            formatted_address=None,
+            lat=req.lat,
+            lng=req.lng,
+            raw=None,
+        )
+    return result
