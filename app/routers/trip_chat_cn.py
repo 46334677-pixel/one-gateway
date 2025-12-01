@@ -3,21 +3,24 @@ import os
 import re
 import urllib.parse
 import urllib.request
+import logging
 from typing import List, Dict, Any, Optional
 
 from fastapi import APIRouter
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.llm_cn import (
     ChatMessage,
     TripChatLLMInput,
     TripChatLLMDecision,
+    SYSTEM_PROMPT,
     call_qwen_for_trip_chat,
 )
 from app.routers.trip import TripPlanRequest, TripPlanResponse, trip_plan
 from app.routers import kb  # 新增：知识库
 
 router = APIRouter(prefix="/cn/v1", tags=["trip_chat"])
+logger = logging.getLogger(__name__)
 
 # ---------- 高德工具 ----------
 def _http_get_json(url: str, params: Dict[str, Any], timeout: float = 5.0):
@@ -76,6 +79,12 @@ class TripChatRequest(BaseModel):
     current_slots: Optional[TripPlanRequest] = None
     location_lat: Optional[float] = None
     location_lng: Optional[float] = None
+    origin: Optional[str] = None
+    default_origin: Optional[str] = Field(
+        None, description="根据用户定位推断的默认出发地，例如：武汉 / 上海"
+    )
+    user_lat: Optional[float] = None
+    user_lng: Optional[float] = None
 
 
 class TripChatResponse(BaseModel):
@@ -136,13 +145,16 @@ def _missing_fields(slots: TripPlanRequest) -> List[str]:
     return missing
 
 # ---------- LLM 调用及解析 ----------
-def _build_llm_input(prompt: str, req: TripChatRequest) -> TripChatLLMInput:
+def _build_llm_input(prompt: str, req: TripChatRequest, system_prompt: Optional[str] = None) -> TripChatLLMInput:
+    lat = req.location_lat if req.location_lat is not None else req.user_lat
+    lng = req.location_lng if req.location_lng is not None else req.user_lng
     return TripChatLLMInput(
         user_id=req.user_id or "",
         history=req.history,
         new_user_message=prompt,
-        location_lat=req.location_lat,
-        location_lng=req.location_lng,
+        location_lat=lat,
+        location_lng=lng,
+        system_prompt=system_prompt,
     )
 
 def _force_json_prompt(user_text: str) -> str:
@@ -182,13 +194,17 @@ def _try_parse_json(txt: str) -> Optional[Dict[str, Any]]:
             continue
     return None
 
-def _call_llm_for_json(req: TripChatRequest):
-    decision = call_qwen_for_trip_chat(_build_llm_input(_force_json_prompt(req.input_text), req))
+def _call_llm_for_json(req: TripChatRequest, system_prompt: Optional[str] = None):
+    decision = call_qwen_for_trip_chat(
+        _build_llm_input(_force_json_prompt(req.input_text), req, system_prompt)
+    )
     reply_text = decision.reply or ""
     parsed = _try_parse_json(reply_text)
     if parsed is not None:
         return reply_text, parsed, decision
-    decision2 = call_qwen_for_trip_chat(_build_llm_input(_retry_json_prompt(req.input_text), req))
+    decision2 = call_qwen_for_trip_chat(
+        _build_llm_input(_retry_json_prompt(req.input_text), req, system_prompt)
+    )
     reply_text2 = decision2.reply or reply_text
     parsed2 = _try_parse_json(reply_text2)
     return reply_text2, parsed2, decision2
@@ -217,13 +233,40 @@ def _kb_to_resources(kb_items):
 # ---------- 主流程 ----------
 @router.post("/trip_chat", response_model=TripChatResponse)
 def trip_chat(req: TripChatRequest) -> TripChatResponse:
+    origin_hint = ""
+    origin_value = req.origin
+    if not origin_value and req.current_slots and getattr(req.current_slots, "origin", None):
+        origin_value = req.current_slots.origin
+    if origin_value:
+        origin_hint = f"???????????????{origin_value}????????????????????????"
+    elif req.default_origin:
+        origin_hint = (
+            "???????????????????????????"
+            f"?{req.default_origin}?????????????????????????"
+            "????????????????"
+            f"???????{req.default_origin}???????????????????????? "
+            "????????????????????????"
+        )
+
+    system_content = SYSTEM_PROMPT
+    if origin_hint:
+        system_content = SYSTEM_PROMPT + "\n\n" + origin_hint
+
+    logger.info(
+        "TripChat origin=%s default_origin=%s user_lat=%s user_lng=%s",
+        origin_value,
+        req.default_origin,
+        req.user_lat,
+        req.user_lng,
+    )
+
     # 1) 知识库优先
     kb_res = kb.kb_search(kb.KbSearch(query=req.input_text, destination=""))
     kb_items = kb_res.get("items") if kb_res else []
     resources_from_kb = _kb_to_resources(kb_items) if kb_items else None
 
     # 2) 调 LLM（强约束 JSON，失败重试一次），保留原始回复
-    reply_text, parsed_json, decision_used = _call_llm_for_json(req)
+    reply_text, parsed_json, decision_used = _call_llm_for_json(req, system_content)
 
     new_history = list(req.history) + [
         ChatMessage(role="user", content=req.input_text),
@@ -238,8 +281,12 @@ def trip_chat(req: TripChatRequest) -> TripChatResponse:
             raw_slots = json.loads(decision_used.slots_json)
             if req.location_lat is not None:
                 raw_slots.setdefault("user_lat", req.location_lat)
+            elif req.user_lat is not None:
+                raw_slots.setdefault("user_lat", req.user_lat)
             if req.location_lng is not None:
                 raw_slots.setdefault("user_lng", req.location_lng)
+            elif req.user_lng is not None:
+                raw_slots.setdefault("user_lng", req.user_lng)
             slots_from_llm = TripPlanRequest.parse_obj(raw_slots)
     except Exception:
         slots_from_llm = None

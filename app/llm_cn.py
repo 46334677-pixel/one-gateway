@@ -97,6 +97,7 @@ class TripChatLLMInput(BaseModel):
     new_user_message: str
     location_lat: Optional[float] = None
     location_lng: Optional[float] = None
+    system_prompt: Optional[str] = None
 
 
 class TripChatLLMDecision(BaseModel):
@@ -111,7 +112,8 @@ class TripChatLLMDecision(BaseModel):
 
 
 def _build_messages(llm_input: TripChatLLMInput):
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    system_content = llm_input.system_prompt or SYSTEM_PROMPT
+    messages = [{"role": "system", "content": system_content}]
 
     for m in llm_input.history:
         role = m.role
