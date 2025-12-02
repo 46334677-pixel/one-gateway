@@ -330,7 +330,18 @@ def trip_chat(req: TripChatRequest) -> TripChatResponse:
         try:
             trip_plan_result = trip_plan(safe_slots)
             if missing:
-                reply_text = f"我先按目前信息出了一版草稿（缺少：{'、'.join(missing)}），请补充后我再优化。\n" + reply_text
+                draft_phrase = "我先按目前信息出了一版草稿"
+                # 只在本轮之前从未提示过“草稿”时，展示完整说明；后续轮次仅针对缺少信息提问
+                already_notified = any(
+                    (m.role == "assistant" and draft_phrase in (m.content or ""))
+                    for m in req.history
+                )
+                missing_text = "、".join(missing)
+                if not already_notified:
+                    prefix = f"{draft_phrase}（缺少：{missing_text}），请补充后我再优化。"
+                else:
+                    prefix = f"现在还缺：{missing_text}，方便告诉我这些信息吗？"
+                reply_text = prefix + "\n" + (reply_text or "")
         except Exception:
             trip_plan_result = None
 

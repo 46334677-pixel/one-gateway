@@ -5,7 +5,7 @@ import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field
 
 from app.security import require_api_key
@@ -164,6 +164,7 @@ def _reverse_geocode_gaode(lat: float, lng: float) -> Optional[ReverseGeocodeRes
         city = comp.get("province")
 
     province = comp.get("province")
+    # TODO: 如果需要，可在这里补充 country 等字段映射
     district = comp.get("district")
     adcode = comp.get("adcode")
     formatted_address = regeocode.get("formatted_address")
@@ -654,3 +655,15 @@ def reverse_geocode(req: ReverseGeocodeRequest) -> ReverseGeocodeResponse:
             raw=None,
         )
     return result
+
+
+@router.get("/reverse_geocode", response_model=ReverseGeocodeResponse)
+def reverse_geocode_get(
+    lat: float = Query(..., description="Latitude (GCJ-02)"),
+    lng: float = Query(..., description="Longitude (GCJ-02)"),
+) -> ReverseGeocodeResponse:
+    """
+    兼容 GET 方式的调用（通过 query 传 lat/lng），内部复用 POST 核心逻辑。
+    """
+    req = ReverseGeocodeRequest(lat=lat, lng=lng)
+    return reverse_geocode(req)
