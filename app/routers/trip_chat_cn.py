@@ -144,6 +144,24 @@ def _missing_fields(slots: TripPlanRequest) -> List[str]:
         missing.append("成人人数")
     return missing
 
+
+def _get_role(m: Any) -> str:
+    """
+    兼容历史消息可能是 Pydantic 对象或 dict，统一返回小写 role。
+    """
+    if isinstance(m, dict):
+        return (m.get("role") or "").lower()
+    return (getattr(m, "role", "") or "").lower()
+
+
+def _get_content(m: Any) -> str:
+    """
+    兼容历史消息可能是 Pydantic 对象或 dict，统一返回 content。
+    """
+    if isinstance(m, dict):
+        return m.get("content") or ""
+    return getattr(m, "content", "") or ""
+
 # ---------- LLM 调用及解析 ----------
 def _build_llm_input(prompt: str, req: TripChatRequest, system_prompt: Optional[str] = None) -> TripChatLLMInput:
     lat = req.location_lat if req.location_lat is not None else req.user_lat
@@ -292,9 +310,11 @@ def trip_chat(req: TripChatRequest) -> TripChatResponse:
         slots_from_llm = None
     slots: Optional[TripPlanRequest] = slots_from_llm or req.current_slots
 
-    # 4) 猜槽位（目的地/天数/出发地/偏好）
+    # 4) Guess slots (destination/days/origin/preferences)
     guess_slots = TripPlanRequest()
-    text_merge = req.input_text + "\n" + "\n".join([m.content for m in req.history if m.role == "user"])
+    text_merge = req.input_text + "\n" + "\n".join([
+        _get_content(m) for m in req.history if _get_role(m) == "user"
+    ])
     guess_slots.destination = _guess_destination(text_merge)
     days = _guess_days(text_merge)
     if days:
@@ -305,7 +325,7 @@ def trip_chat(req: TripChatRequest) -> TripChatResponse:
     if slots is None and guess_slots.destination:
         slots = guess_slots
 
-    # 5) 如果 KB 命中，直接返回 resources
+    # 5) If KB hits, return resources directly
     if resources_from_kb:
         return TripChatResponse(
             reply=reply_text,
@@ -315,7 +335,7 @@ def trip_chat(req: TripChatRequest) -> TripChatResponse:
             resources=resources_from_kb,
         )
 
-    # 6) 决定是否调 TripPlan：有目的地，或用户已说满 3 轮
+    # 6) Decide whether to call TripPlan
     should_call_plan = False
     if slots and slots.destination:
         should_call_plan = True
@@ -330,23 +350,29 @@ def trip_chat(req: TripChatRequest) -> TripChatResponse:
         try:
             trip_plan_result = trip_plan(safe_slots)
             if missing:
-                draft_phrase = "我先按目前信息出了一版草稿"
-                # 只在本轮之前从未提示过“草稿”时，展示完整说明；后续轮次仅针对缺少信息提问
+                draft_phrase = "\u6211\u5148\u6309\u76ee\u524d\u4fe1\u606f\u51fa\u4e86\u4e00\u7248\u8349\u7a3f"
                 already_notified = any(
-                    (m.role == "assistant" and draft_phrase in (m.content or ""))
-                    for m in req.history
+                    (_get_role(m).startswith("assistant") and draft_phrase in _get_content(m))
+                    for m in (req.history or [])
                 )
-                missing_text = "、".join(missing)
+                missing_text = "\u3001".join(missing)
                 if not already_notified:
-                    prefix = f"{draft_phrase}（缺少：{missing_text}），请补充后我再优化。"
+                    prefix = f"{draft_phrase}\uff08\u7f3a\u5c11\uff1a{missing_text}\uff09\uff0c\u8bf7\u8865\u5145\u540e\u6211\u518d\u4f18\u5316\u3002"
                 else:
-                    prefix = f"现在还缺：{missing_text}，方便告诉我这些信息吗？"
+                    prefix = f"\u73b0\u5728\u8fd8\u7f3a\uff1a{missing_text}\uff0c\u65b9\u4fbf\u544a\u8bc9\u6211\u8fd9\u4e9b\u4fe1\u606f\u5417\uff1f"
                 reply_text = prefix + "\n" + (reply_text or "")
         except Exception:
             trip_plan_result = None
 
+    if new_history and _get_role(new_history[-1]).startswith("assistant"):
+        try:
+            new_history[-1].content = reply_text
+        except Exception:
+            if isinstance(new_history[-1], dict):
+                new_history[-1]["content"] = reply_text
+
     return TripChatResponse(
-        reply=reply_text or "这边现在有点忙，你可以稍后再试试。",
+        reply=reply_text or "\u8fd9\u8fb9\u73b0\u5728\u6709\u70b9\u5fd9\uff0c\u4f60\u53ef\u4ee5\u7a0d\u540e\u518d\u8bd5\u8bd5\uff5e",
         history=new_history,
         slots=slots,
         trip_plan=trip_plan_result,
