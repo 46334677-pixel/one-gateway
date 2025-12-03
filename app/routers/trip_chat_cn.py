@@ -312,6 +312,8 @@ def trip_chat(req: TripChatRequest) -> TripChatResponse:
 
     if slots is None and guess_slots.destination:
         slots = guess_slots
+    elif slots and not slots.destination and guess_slots.destination:
+        slots.destination = guess_slots.destination
 
     # 5) 如果 KB 命中，直接返回 resources
     if resources_from_kb:
@@ -331,11 +333,20 @@ def trip_chat(req: TripChatRequest) -> TripChatResponse:
         slots = guess_slots
         should_call_plan = True
 
+    logger.info(
+        "TripChat debug: user_turns=%s, has_slots=%s, slots=%s, guess_destination=%s, should_call_plan=%s",
+        user_turns,
+        bool(slots),
+        slots.dict() if isinstance(slots, TripPlanRequest) else str(slots),
+        guess_slots.destination if 'guess_slots' in locals() else None,
+        should_call_plan,
+    )
     trip_plan_result: Optional[TripPlanResponse] = None
     if should_call_plan and slots:
         safe_slots = _fill_defaults(slots)
         missing = _missing_fields(safe_slots)
         try:
+            logger.info("TripChat debug: calling trip_plan with safe_slots=%s", safe_slots.dict())
             trip_plan_result = trip_plan(safe_slots)
             if missing:
                 draft_phrase = "我先按目前信息出了一版草稿"
@@ -350,7 +361,11 @@ def trip_chat(req: TripChatRequest) -> TripChatResponse:
                 else:
                     prefix = f"现在还缺：{missing_text}，方便告诉我这些信息吗？"
                 reply_text = prefix + "\n" + (reply_text or "")
+            else:
+                prefix = "好的，我已经根据你提供的信息生成了一份行程草案。"
+                reply_text = prefix + "\n" + (reply_text or "")
         except Exception:
+            logger.exception("TripChat error when calling trip_plan")
             trip_plan_result = None
 
     return TripChatResponse(
