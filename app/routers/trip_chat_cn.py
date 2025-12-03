@@ -276,11 +276,10 @@ def trip_chat(req: TripChatRequest) -> TripChatResponse:
     # 2) 调 LLM（强约束 JSON，失败重试一次），保留原始回复
     reply_text, parsed_json, decision_used = _call_llm_for_json(req, system_content)
 
-    new_history = list(req.history) + [
+    history_with_new_user = list(req.history) + [
         ChatMessage(role="user", content=req.input_text),
-        ChatMessage(role="assistant", content=reply_text),
     ]
-    user_turns = _count_user_turns(new_history)
+    user_turns = _count_user_turns(history_with_new_user)
 
     # 3) 解析 slots_json，或用 current_slots
     slots_from_llm: Optional[TripPlanRequest] = None
@@ -317,6 +316,9 @@ def trip_chat(req: TripChatRequest) -> TripChatResponse:
 
     # 5) 如果 KB 命中，直接返回 resources
     if resources_from_kb:
+        new_history = history_with_new_user + [
+            ChatMessage(role="assistant", content=reply_text),
+        ]
         return TripChatResponse(
             reply=reply_text,
             history=new_history,
@@ -367,6 +369,10 @@ def trip_chat(req: TripChatRequest) -> TripChatResponse:
         except Exception:
             logger.exception("TripChat error when calling trip_plan")
             trip_plan_result = None
+
+    new_history = history_with_new_user + [
+        ChatMessage(role="assistant", content=reply_text),
+    ]
 
     return TripChatResponse(
         reply=reply_text or "这边现在有点忙，你可以稍后再试试。",
