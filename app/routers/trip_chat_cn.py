@@ -231,34 +231,38 @@ def _kb_to_resources(kb_items):
     return {"tickets": tickets} if tickets else None
 
 # ---------- 主流程 ----------
+# ---------- 主流程 ----------
 @router.post("/trip_chat", response_model=TripChatResponse)
 def trip_chat(req: TripChatRequest) -> TripChatResponse:
     """
-    ??? TripChat?
-    - ??????????????????????
-    - ?????????? resources?
-    - ?????? TripPlanRequest ?????? trip_plan ???????
-    - ??????????? + ??????? trip_plan ???? trip_plan ?????
+    中文 TripChat 主流程：
+    - 结合 origin / default_origin 补充出发地提示；
+    - 命中知识库时生成图文 resources（但不阻止后续行程规划）；
+    - 调 LLM 生成景点 JSON（目前主要用于资源展示，可视为“闲聊回答”）；
+    - 尝试构造 TripPlanRequest 槽位并调用 trip_plan 生成行程；
+    - 在 reply 中适当加上“草稿说明”，但 trip_plan 始终通过字段返回给前端。
     """
-    # ----- ??????origin / default_origin -----
+    # ----- 出发地提示 -----
     origin_hint = ""
     origin_value = req.origin
     if not origin_value and req.current_slots and getattr(req.current_slots, "origin", None):
         origin_value = req.current_slots.origin
 
     if origin_value:
+        # 用户已经明确出发城市
         origin_hint = (
-            "??????????????????????"
-            f"?????????{origin_value}??"
-            "?????????????????????"
+            "系统补充背景信息：用户已经有明确的出发城市，"
+            f"当前假定出发地为「{origin_value}」。"
+            "在规划行程时，请优先以这个城市作为出发地。"
         )
     elif req.default_origin:
+        # 没有显式 origin，用 default_origin 作为推断出的出发地
         origin_hint = (
-            "??????????????????????"
-            f"????????{req.default_origin}??"
-            "???????????????????"
-            "??????????????"
-            "?????????????????????????"
+            "系统补充背景信息：根据用户最近一次定位推断，"
+            f"用户大概率位于「{req.default_origin}」。"
+            "如果用户在对话中没有特别说明出发城市，"
+            "你可以暂时假设出发地为这里；"
+            "一旦用户提供了新的出发城市，以用户的最新说明为准。"
         )
 
     system_content = SYSTEM_PROMPT
@@ -266,46 +270,42 @@ def trip_chat(req: TripChatRequest) -> TripChatResponse:
         system_content = SYSTEM_PROMPT + "\n\n" + origin_hint
 
     logger.info(
-        "TripChat start: origin=%s default_origin=%s user_lat=%s user_lng=%s",
+        "TripChat origin=%s default_origin=%s user_lat=%s user_lng=%s",
         origin_value,
         req.default_origin,
         req.user_lat,
         req.user_lng,
     )
 
-    # ----- 1) ??????????? -----
+    # ----- 1) 知识库：不再早退，只先记下 resources -----
     kb_res = kb.kb_search(kb.KbSearch(query=req.input_text, destination=""))
     kb_items = kb_res.get("items") if kb_res else []
     resources_from_kb = _kb_to_resources(kb_items) if kb_items else None
 
-    # ----- 2) ? LLM???? JSON??????? -----
+    # ----- 2) 调 LLM（强约束 JSON，失败重试一次），保留原始回复 -----
     reply_text, parsed_json, decision_used = _call_llm_for_json(req, system_content)
-    if reply_text is None:
-        reply_text = ""
+    reply_text = reply_text or ""
 
-    # ????????????? history????? user_turns
+    # 只把“本轮用户消息”先加进 history，用于统计 user_turns
     history_with_new_user = list(req.history) + [
         ChatMessage(role="user", content=req.input_text),
     ]
     user_turns = _count_user_turns(history_with_new_user)
 
-    # ----- 3) ? LLM ? slots_json ??? TripPlanRequest -----
+    # ----- 3) 解析 slots_json，或用 current_slots -----
     slots_from_llm: Optional[TripPlanRequest] = None
     try:
-        raw_slots: Dict[str, Any] = {}
         if getattr(decision_used, "slots_json", None):
             raw_slots = json.loads(decision_used.slots_json) or {}
-        # ??????
-        if req.location_lat is not None:
-            raw_slots.setdefault("user_lat", req.location_lat)
-        elif req.user_lat is not None:
-            raw_slots.setdefault("user_lat", req.user_lat)
-        if req.location_lng is not None:
-            raw_slots.setdefault("user_lng", req.location_lng)
-        elif req.user_lng is not None:
-            raw_slots.setdefault("user_lng", req.user_lng)
-
-        if raw_slots:
+            # 补充用户坐标
+            if req.location_lat is not None:
+                raw_slots.setdefault("user_lat", req.location_lat)
+            elif req.user_lat is not None:
+                raw_slots.setdefault("user_lat", req.user_lat)
+            if req.location_lng is not None:
+                raw_slots.setdefault("user_lng", req.location_lng)
+            elif req.user_lng is not None:
+                raw_slots.setdefault("user_lng", req.user_lng)
             slots_from_llm = TripPlanRequest.parse_obj(raw_slots)
     except Exception:
         logger.exception("TripChat: failed to parse slots_json")
@@ -313,24 +313,24 @@ def trip_chat(req: TripChatRequest) -> TripChatResponse:
 
     slots: Optional[TripPlanRequest] = slots_from_llm or req.current_slots
 
-    # ----- 4) ???????? / ??? / ?? -----
+    # ----- 4) 猜槽位（目的地/天数/出发地/偏好），并与 slots 融合 -----
+    guess_slots = TripPlanRequest()
     text_merge = req.input_text + "\n" + "\n".join(
         [m.content for m in req.history if m.role == "user"]
     )
-    guess_slots = TripPlanRequest()
     guess_slots.destination = _guess_destination(text_merge)
     days = _guess_days(text_merge)
     if days:
-        # ???????????????????? date_range
+        # 目前仅用“天数存在”这个信号，不强行构造 date_range
         guess_slots.date_range = []
     guess_slots.origin = _guess_origin(text_merge)
     guess_slots.preferences = _guess_preferences(text_merge)
 
-    # ?????? slots??????????? guess_slots
+    # 如果完全没有 slots，但猜到了目的地，则用 guess_slots
     if slots is None and guess_slots.destination:
         slots = guess_slots
 
-    # ??? guess_slots ?? slots ???????????/LLM ???????
+    # 用猜测结果补全 slots 中缺失的部分字段（不覆盖已有值）
     if slots is not None:
         if not slots.destination and guess_slots.destination:
             slots.destination = guess_slots.destination
@@ -339,7 +339,7 @@ def trip_chat(req: TripChatRequest) -> TripChatResponse:
         if not slots.preferences and guess_slots.preferences:
             slots.preferences = guess_slots.preferences
 
-    # ----- 5) TripPlan ???? -----
+    # ----- 5) 调 TripPlan：只要有 slots 就尝试调用，让 TripPlan 自己判断信息是否充分 -----
     trip_plan_result: Optional[TripPlanResponse] = None
     missing: List[str] = []
 
@@ -372,7 +372,7 @@ def trip_chat(req: TripChatRequest) -> TripChatResponse:
         ChatMessage(role="assistant", content=reply_text),
     ]
 
-    # ----- 8) 组装响应 -----
+    # ----- 8) 组装响应：resources_from_kb 和 trip_plan 都一起返回 -----
     return TripChatResponse(
         reply=reply_text or "这边现在有点忙，你可以稍后再试试。",
         history=new_history,
@@ -380,4 +380,3 @@ def trip_chat(req: TripChatRequest) -> TripChatResponse:
         trip_plan=trip_plan_result,
         resources=resources_from_kb,
     )
-
