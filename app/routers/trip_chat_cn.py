@@ -328,11 +328,9 @@ def trip_chat(req: TripChatRequest) -> TripChatResponse:
         )
 
     # 6) 决定是否调 TripPlan：有目的地，或用户已说满 3 轮
-    should_call_plan = False
-    if slots and slots.destination:
-        should_call_plan = True
-    elif user_turns >= 3 and guess_slots.destination:
-        slots = guess_slots
+    if slots is None:
+        should_call_plan = False
+    else:
         should_call_plan = True
 
     logger.info(
@@ -379,5 +377,5 @@ def trip_chat(req: TripChatRequest) -> TripChatResponse:
         history=new_history,
         slots=slots,
         trip_plan=trip_plan_result,
-        resources=None,
+        resources=resources_from_kb,
     )
