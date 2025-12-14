@@ -231,21 +231,38 @@ def _kb_to_resources(kb_items):
     return {"tickets": tickets} if tickets else None
 
 # ---------- 主流程 ----------
+# ---------- 主流程 ----------
 @router.post("/trip_chat", response_model=TripChatResponse)
 def trip_chat(req: TripChatRequest) -> TripChatResponse:
+    """
+    中文 TripChat 主流程：
+    - 结合 origin / default_origin 补充出发地提示；
+    - 命中知识库时生成图文 resources（但不阻止后续行程规划）；
+    - 调 LLM 生成景点 JSON（目前主要用于资源展示，可视为“闲聊回答”）；
+    - 尝试构造 TripPlanRequest 槽位并调用 trip_plan 生成行程；
+    - 在 reply 中适当加上“草稿说明”，但 trip_plan 始终通过字段返回给前端。
+    """
+    # ----- 出发地提示 -----
     origin_hint = ""
     origin_value = req.origin
     if not origin_value and req.current_slots and getattr(req.current_slots, "origin", None):
         origin_value = req.current_slots.origin
+
     if origin_value:
-        origin_hint = f"???????????????{origin_value}????????????????????????"
-    elif req.default_origin:
+        # 用户已经明确出发城市
         origin_hint = (
-            "???????????????????????????"
-            f"?{req.default_origin}?????????????????????????"
-            "????????????????"
-            f"???????{req.default_origin}???????????????????????? "
-            "????????????????????????"
+            "系统补充背景信息：用户已经有明确的出发城市，"
+            f"当前假定出发地为「{origin_value}」。"
+            "在规划行程时，请优先以这个城市作为出发地。"
+        )
+    elif req.default_origin:
+        # 没有显式 origin，用 default_origin 作为推断出的出发地
+        origin_hint = (
+            "系统补充背景信息：根据用户最近一次定位推断，"
+            f"用户大概率位于「{req.default_origin}」。"
+            "如果用户在对话中没有特别说明出发城市，"
+            "你可以暂时假设出发地为这里；"
+            "一旦用户提供了新的出发城市，以用户的最新说明为准。"
         )
 
     system_content = SYSTEM_PROMPT
@@ -260,25 +277,27 @@ def trip_chat(req: TripChatRequest) -> TripChatResponse:
         req.user_lng,
     )
 
-    # 1) 知识库优先
+    # ----- 1) 知识库：不再早退，只先记下 resources -----
     kb_res = kb.kb_search(kb.KbSearch(query=req.input_text, destination=""))
     kb_items = kb_res.get("items") if kb_res else []
     resources_from_kb = _kb_to_resources(kb_items) if kb_items else None
 
-    # 2) 调 LLM（强约束 JSON，失败重试一次），保留原始回复
+    # ----- 2) 调 LLM（强约束 JSON，失败重试一次），保留原始回复 -----
     reply_text, parsed_json, decision_used = _call_llm_for_json(req, system_content)
+    reply_text = reply_text or ""
 
-    new_history = list(req.history) + [
+    # 只把“本轮用户消息”先加进 history，用于统计 user_turns
+    history_with_new_user = list(req.history) + [
         ChatMessage(role="user", content=req.input_text),
-        ChatMessage(role="assistant", content=reply_text),
     ]
-    user_turns = _count_user_turns(new_history)
+    user_turns = _count_user_turns(history_with_new_user)
 
-    # 3) 解析 slots_json，或用 current_slots
+    # ----- 3) 解析 slots_json，或用 current_slots -----
     slots_from_llm: Optional[TripPlanRequest] = None
     try:
         if getattr(decision_used, "slots_json", None):
-            raw_slots = json.loads(decision_used.slots_json)
+            raw_slots = json.loads(decision_used.slots_json) or {}
+            # 补充用户坐标
             if req.location_lat is not None:
                 raw_slots.setdefault("user_lat", req.location_lat)
             elif req.user_lat is not None:
@@ -289,66 +308,76 @@ def trip_chat(req: TripChatRequest) -> TripChatResponse:
                 raw_slots.setdefault("user_lng", req.user_lng)
             slots_from_llm = TripPlanRequest.parse_obj(raw_slots)
     except Exception:
+        logger.exception("TripChat: failed to parse slots_json")
         slots_from_llm = None
+
     slots: Optional[TripPlanRequest] = slots_from_llm or req.current_slots
 
-    # 4) 猜槽位（目的地/天数/出发地/偏好）
+    # ----- 4) 猜槽位（目的地/天数/出发地/偏好），并与 slots 融合 -----
     guess_slots = TripPlanRequest()
-    text_merge = req.input_text + "\n" + "\n".join([m.content for m in req.history if m.role == "user"])
+    text_merge = req.input_text + "\n" + "\n".join(
+        [m.content for m in req.history if m.role == "user"]
+    )
     guess_slots.destination = _guess_destination(text_merge)
     days = _guess_days(text_merge)
     if days:
+        # 目前仅用“天数存在”这个信号，不强行构造 date_range
         guess_slots.date_range = []
     guess_slots.origin = _guess_origin(text_merge)
     guess_slots.preferences = _guess_preferences(text_merge)
 
+    # 如果完全没有 slots，但猜到了目的地，则用 guess_slots
     if slots is None and guess_slots.destination:
         slots = guess_slots
 
-    # 5) 如果 KB 命中，直接返回 resources
-    if resources_from_kb:
-        return TripChatResponse(
-            reply=reply_text,
-            history=new_history,
-            slots=slots,
-            trip_plan=None,
-            resources=resources_from_kb,
-        )
+    # 用猜测结果补全 slots 中缺失的部分字段（不覆盖已有值）
+    if slots is not None:
+        if not slots.destination and guess_slots.destination:
+            slots.destination = guess_slots.destination
+        if not slots.origin and guess_slots.origin:
+            slots.origin = guess_slots.origin
+        if not slots.preferences and guess_slots.preferences:
+            slots.preferences = guess_slots.preferences
 
-    # 6) 决定是否调 TripPlan：有目的地，或用户已说满 3 轮
-    should_call_plan = False
-    if slots and slots.destination:
-        should_call_plan = True
-    elif user_turns >= 3 and guess_slots.destination:
-        slots = guess_slots
-        should_call_plan = True
-
+    # ----- 5) 调 TripPlan：只要有 slots 就尝试调用，让 TripPlan 自己判断信息是否充分 -----
     trip_plan_result: Optional[TripPlanResponse] = None
-    if should_call_plan and slots:
+    missing: List[str] = []
+
+    if slots is not None:
         safe_slots = _fill_defaults(slots)
         missing = _missing_fields(safe_slots)
         try:
+            logger.info("TripChat: calling trip_plan with slots=%s", safe_slots.dict())
             trip_plan_result = trip_plan(safe_slots)
-            if missing:
-                draft_phrase = "我先按目前信息出了一版草稿"
-                # 只在本轮之前从未提示过“草稿”时，展示完整说明；后续轮次仅针对缺少信息提问
-                already_notified = any(
-                    (m.role == "assistant" and draft_phrase in (m.content or ""))
-                    for m in req.history
-                )
-                missing_text = "、".join(missing)
-                if not already_notified:
-                    prefix = f"{draft_phrase}（缺少：{missing_text}），请补充后我再优化。"
-                else:
-                    prefix = f"现在还缺：{missing_text}，方便告诉我这些信息吗？"
-                reply_text = prefix + "\n" + (reply_text or "")
         except Exception:
+            logger.exception("TripChat: error when calling trip_plan")
             trip_plan_result = None
 
+    # ----- 6) 根据缺失字段增加“草稿说明”前缀（最多解释一次） -----
+    if trip_plan_result is not None and missing:
+        draft_phrase = "我先按目前信息出了一版草稿"
+        already_notified = any(
+            (m.role == "assistant" and draft_phrase in (m.content or ""))
+            for m in req.history
+        )
+        missing_text = "、".join(missing)
+        if not already_notified:
+            prefix = f"{draft_phrase}（缺少：{missing_text}），请补充后我再优化。"
+        else:
+            prefix = f"现在还缺：{missing_text}，方便告诉我这些信息吗？"
+        reply_text = prefix + "\n" + (reply_text or "")
+
+    # ----- 7) 最终 history：把本轮 assistant 回复加进去 -----
+    new_history = history_with_new_user + [
+        ChatMessage(role="assistant", content=reply_text),
+    ]
+
+    # ----- 8) 组装响应：resources_from_kb 和 trip_plan 都一起返回 -----
     return TripChatResponse(
         reply=reply_text or "这边现在有点忙，你可以稍后再试试。",
         history=new_history,
         slots=slots,
         trip_plan=trip_plan_result,
-        resources=None,
+        resources=resources_from_kb,
     )
+
