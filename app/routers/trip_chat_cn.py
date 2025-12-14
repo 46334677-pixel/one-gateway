@@ -99,12 +99,34 @@ def _count_user_turns(history: List[ChatMessage]) -> int:
     return sum(1 for m in history if m.role == "user")
 
 def _guess_destination(text: str) -> Optional[str]:
-    m = re.search(r"(?:去|到|去往|想去|想去到|去一趟)([\u4e00-\u9fa5A-Za-z]{2,10})", text)
+    # 1) “去/到/想去 + 地名 + （玩）N天/日”优先匹配
+    m = re.search(
+        r"(?:去|到|去往|想去|想去到|去一趟)"
+        r"([\u4e00-\u9fa5A-Za-z]{2,10})"
+        r"(?:玩)?\s*\d+\s*(?:天|日)",
+        text,
+    )
     if m:
-        return m.group(1)
-    m2 = re.search(r"([\u4e00-\u9fa5A-Za-z]{2,10})\s*(?:\d+天|日)游", text)
+        dest = m.group(1)
+        dest = re.sub(r"(市|区|县|玩)$", "", dest)
+        return dest
+
+    # 2) “大阪2天游/东京三日游”这类表达
+    m2 = re.search(
+        r"([\u4e00-\u9fa5A-Za-z]{2,10})\s*(?:\d+\s*(?:天|日)|[二三四五六七八九十]+\s*(?:天|日))\s*游?",
+        text,
+    )
     if m2:
-        return m2.group(1)
+        dest = m2.group(1)
+        dest = re.sub(r"(市|区|县)$", "", dest)
+        return dest
+
+    # 3) 退化到最基础的“去/到/想去 + 地名”
+    m3 = re.search(r"(?:去|到|去往|想去|想去到|去一趟)([\u4e00-\u9fa5A-Za-z]{2,10})", text)
+    if m3:
+        dest = m3.group(1)
+        dest = re.sub(r"(市|区|县)$", "", dest)
+        return dest
     return None
 
 def _guess_days(text: str) -> Optional[int]:
@@ -126,10 +148,22 @@ def _guess_preferences(text: str) -> List[str]:
 
 def _fill_defaults(slots: TripPlanRequest) -> TripPlanRequest:
     data = slots.dict()
-    data.setdefault("adults", 2)
-    data.setdefault("children", 0)
-    data.setdefault("budget_level", "medium")
-    data.setdefault("date_range", data.get("date_range") or [])
+    # 日期范围兜底为空列表
+    if not data.get("date_range"):
+        data["date_range"] = []
+
+    # 预算档位默认
+    if data.get("budget_level") is None:
+        data["budget_level"] = "medium"
+
+    # 成人/儿童默认：仅在 adults 与 people_count 都缺失时设置
+    adults = data.get("adults")
+    people_count = data.get("people_count")
+    if adults is None and people_count is None:
+        data["adults"] = 2
+        if data.get("children") is None:
+            data["children"] = 0
+
     return TripPlanRequest.parse_obj(data)
 
 def _missing_fields(slots: TripPlanRequest) -> List[str]:
@@ -338,6 +372,12 @@ def trip_chat(req: TripChatRequest) -> TripChatResponse:
             slots.origin = guess_slots.origin
         if not slots.preferences and guess_slots.preferences:
             slots.preferences = guess_slots.preferences
+        # 进一步：若仍无 origin，尝试用显式 origin 或 default_origin 补上
+        if not slots.origin:
+            if origin_value:
+                slots.origin = origin_value
+            elif req.default_origin:
+                slots.origin = req.default_origin
 
     # ----- 5) 调 TripPlan：只要有 slots 就尝试调用，让 TripPlan 自己判断信息是否充分 -----
     trip_plan_result: Optional[TripPlanResponse] = None
