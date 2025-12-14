@@ -79,6 +79,12 @@ class Packages(BaseModel):
     tips: Optional[str] = None
 
 
+class TripPlanMeta(BaseModel):
+    quality_score: Optional[int] = None  # 0-100
+    warnings: Optional[List[str]] = None  # max 5
+    fixed: Optional[List[str]] = None
+
+
 class ReverseGeocodeRequest(BaseModel):
     lat: float = Field(..., description="Latitude (GCJ-02)")
     lng: float = Field(..., description="Longitude (GCJ-02)")
@@ -101,6 +107,7 @@ class TripPlanResponse(BaseModel):
     inputs: TripPlanRequest
     itinerary: List[str]
     resources: Optional[TripResources] = None
+    meta: Optional[TripPlanMeta] = None
     opening_list: Optional[List[Dict[str, Any]]] = None
     weather_daily: Optional[List[Dict[str, Any]]] = None
     debug: Optional[Dict[str, Any]] = None
@@ -118,6 +125,319 @@ class UserMemory(BaseModel):
 
 
 USER_MEMORY: Dict[str, UserMemory] = {}
+
+
+def _safe_unique_keep_order(items: List[str]) -> List[str]:
+    seen = set()
+    out: List[str] = []
+    for x in items or []:
+        x = (x or "").strip()
+        if not x or x in seen:
+            continue
+        out.append(x)
+        seen.add(x)
+    return out
+
+
+def _infer_slot_key(text: str) -> Optional[str]:
+    s = text or ""
+    if "上午" in s or "早上" in s or "清晨" in s:
+        return "morning"
+    if "下午" in s or "中午" in s or "午后" in s:
+        return "afternoon"
+    if "晚上" in s or "夜间" in s or "夜晚" in s:
+        return "evening"
+    return None
+
+
+def _infer_day_index(text: str) -> Optional[int]:
+    import re
+
+    s = text or ""
+    m = re.search(r"(?:^|[\\s,，])(?:D|Day)\\s*0*([1-9]\\d?)", s, re.IGNORECASE)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            return None
+    m = re.search(r"第\\s*([1-9]\\d?)\\s*天", s)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            return None
+    return None
+
+
+def _split_place_list(text: str) -> List[str]:
+    import re
+
+    s = (text or "").strip()
+    if not s:
+        return []
+
+    s = re.sub(r"（.*?）", "", s)
+    s = re.sub(r"\\(.*?\\)", "", s)
+    s = s.strip()
+
+    has_sep = any(sep in s for sep in ("、", "/", "|", "；", ";", "，", ","))
+    if len(s) > 24 and not has_sep:
+        return []
+
+    parts = re.split(r"[、/|；;，,]+", s)
+    cleaned = [(p or "").strip() for p in parts]
+    cleaned = [p for p in cleaned if p]
+    return cleaned
+
+
+def _parse_itinerary_days(itinerary: List[str]) -> Dict[int, Dict[str, List[str]]]:
+    days: Dict[int, Dict[str, List[str]]] = {}
+    current_day = 1
+
+    for raw_line in itinerary or []:
+        line = (raw_line or "").strip()
+        if not line:
+            continue
+
+        d = _infer_day_index(line)
+        if d is not None:
+            current_day = d
+
+        slot = _infer_slot_key(line)
+        if slot is None:
+            continue
+
+        content = line
+        if "：" in content:
+            content = content.split("：", 1)[1]
+        elif ":" in content:
+            content = content.split(":", 1)[1]
+        content = content.strip()
+        items = _split_place_list(content)
+        if not items:
+            continue
+
+        if current_day not in days:
+            days[current_day] = {"morning": [], "afternoon": [], "evening": []}
+        days[current_day][slot].extend(items)
+
+    for di in list(days.keys()):
+        for slot in ("morning", "afternoon", "evening"):
+            days[di][slot] = _safe_unique_keep_order(days[di].get(slot, []))
+    return days
+
+
+def _placeholders_for_prefs(prefs: List[str]) -> Dict[str, List[str]]:
+    prefs_set = set([p for p in (prefs or []) if p])
+
+    is_family = any(p in ("kids", "亲子", "family") for p in prefs_set)
+    is_elder = any(p in ("elders", "老人", "长辈") for p in prefs_set)
+    is_hike = any(p in ("hike", "轻徒步", "徒步") for p in prefs_set)
+    is_food = any(p in ("food", "美食") for p in prefs_set)
+
+    morning = ["城市地标/经典景点"]
+    afternoon = ["博物馆/室内展馆"]
+    evening = ["夜市/步行街"]
+
+    if is_family:
+        morning = ["动物园/海洋馆/亲子乐园"]
+        afternoon = ["公园遛娃/室内亲子馆"]
+        evening = ["早点休息/酒店附近散步"]
+    elif is_elder:
+        morning = ["公园/江边步道（轻松）"]
+        afternoon = ["老街/历史街区（少走路）"]
+        evening = ["清淡晚餐/早点休息"]
+
+    if is_hike:
+        morning = ["郊野公园轻徒步/观景步道"]
+
+    if is_food:
+        evening = ["特色小吃街/夜市"]
+        if not is_family and not is_elder:
+            afternoon = ["当地口碑餐厅/美食街"]
+
+    return {"morning": morning, "afternoon": afternoon, "evening": evening}
+
+
+def _append_warning(warnings: List[str], msg: str):
+    if not msg:
+        return
+    if msg in warnings:
+        return
+    if len(warnings) >= 5:
+        return
+    warnings.append(msg)
+
+
+def postProcessTripPlan(tripPlan: TripPlanResponse, userInput: TripPlanRequest) -> TripPlanResponse:
+    """
+    Trip plan quality patch: normalize -> trim -> crowdFit -> sanityWarnings -> qualityScore.
+    Keep existing field structures; only adds/updates `meta` and re-writes `itinerary` as List[str].
+    """
+
+    fixed: List[str] = []
+    warnings: List[str] = []
+
+    prefs = userInput.preferences or userInput.interests or []
+    placeholders = _placeholders_for_prefs(prefs)
+
+    days = _infer_days(userInput.date_range)
+    if days <= 0:
+        days = 1
+
+    origin = (userInput.origin or "").strip()
+
+    ticket_names: List[str] = []
+    food_names: List[str] = []
+    if tripPlan.resources and tripPlan.resources.tickets:
+        ticket_names = [r.name for r in tripPlan.resources.tickets if r and r.name]
+    if tripPlan.resources and tripPlan.resources.foods:
+        food_names = [r.name for r in tripPlan.resources.foods if r and r.name]
+    ticket_names = _safe_unique_keep_order(ticket_names)
+    food_names = _safe_unique_keep_order(food_names)
+
+    if not ticket_names:
+        _append_warning(warnings, "景点数据较少，本次为通用建议，可结合地图搜索补充")
+
+    parsed_days = _parse_itinerary_days(tripPlan.itinerary or [])
+    used = set()
+
+    def pick_from_pool(pool: List[str], count: int) -> List[str]:
+        if not pool or count <= 0:
+            return []
+        out: List[str] = []
+        for x in pool:
+            if x in used:
+                continue
+            out.append(x)
+            used.add(x)
+            if len(out) >= count:
+                break
+        if len(out) < count:
+            for x in pool:
+                if len(out) >= count:
+                    break
+                if x not in out:
+                    out.append(x)
+        return out
+
+    trimmed_any = False
+    normalized: Dict[int, Dict[str, List[str]]] = {}
+
+    for di in range(1, days + 1):
+        normalized[di] = {"morning": [], "afternoon": [], "evening": []}
+        for slot in ("morning", "afternoon", "evening"):
+            items = (parsed_days.get(di, {}) or {}).get(slot, []) or []
+            items = _safe_unique_keep_order(items)
+
+            if len(items) > 3:
+                items = items[:3]
+                trimmed_any = True
+                _append_warning(warnings, "已精简：单段地点过多已裁剪到最多 3 个")
+
+            if not items:
+                if slot == "morning":
+                    items = pick_from_pool(ticket_names, 2) or placeholders["morning"][:]
+                elif slot == "afternoon":
+                    items = pick_from_pool(ticket_names, 1)
+                    if any(p in ("food", "美食") for p in (prefs or [])) and food_names:
+                        items = (items or []) + pick_from_pool(food_names, 1)
+                    items = items or placeholders["afternoon"][:]
+                else:
+                    items = pick_from_pool(food_names, 1) or placeholders["evening"][:]
+
+            if not items:
+                items = ["酒店附近散步/休息"]
+
+            if len(items) > 3:
+                items = items[:3]
+                trimmed_any = True
+                _append_warning(warnings, "已精简：单段地点过多已裁剪到最多 3 个")
+
+            normalized[di][slot] = items
+
+    fixed.append("补齐三段")
+    if trimmed_any:
+        fixed.append("精简过多景点")
+
+    def ensure_keyword_in_plan(keyword: str, inject_name: str):
+        found = False
+        for di in range(1, days + 1):
+            for slot in ("morning", "afternoon", "evening"):
+                if any(keyword in x for x in normalized[di][slot]):
+                    found = True
+                    break
+            if found:
+                break
+        if found:
+            return
+
+        slot = "afternoon"
+        if len(normalized[1][slot]) < 3:
+            normalized[1][slot].insert(0, inject_name)
+        else:
+            normalized[1][slot][-1] = inject_name
+        fixed.append("偏好适配补充")
+
+    prefs_set = set([p for p in (prefs or []) if p])
+    if any(p in ("kids", "亲子", "family") for p in prefs_set):
+        ensure_keyword_in_plan("亲子", "亲子友好景点（如动物园/亲子乐园）")
+    if any(p in ("elders", "老人", "长辈") for p in prefs_set):
+        ensure_keyword_in_plan("老人", "老人友好路线（少走路/多休息）")
+    if any(p in ("hike", "轻徒步", "徒步") for p in prefs_set):
+        ensure_keyword_in_plan("徒步", "轻徒步/公园步道（强度可调）")
+    if any(p in ("food", "美食") for p in prefs_set):
+        ensure_keyword_in_plan("美食", "美食打卡（口碑餐厅/小吃街）")
+
+    summary = tripPlan.summary or ""
+    crowd_notes: List[str] = []
+    if any(p in ("kids", "亲子", "family") for p in prefs_set):
+        crowd_notes.append("亲子（轻松节奏/亲子友好）")
+    if any(p in ("elders", "老人", "长辈") for p in prefs_set):
+        crowd_notes.append("老人（少走路/多休息）")
+    if any(p in ("hike", "轻徒步", "徒步") for p in prefs_set):
+        crowd_notes.append("轻徒步（强度可调）")
+    if any(p in ("food", "美食") for p in prefs_set):
+        crowd_notes.append("美食（口碑餐厅/小吃街）")
+
+    if crowd_notes and not any(k in summary for k in ("亲子", "老人", "徒步", "美食")):
+        summary = f"{summary} 偏好适配：{'，'.join(crowd_notes)}。"
+        fixed.append("偏好说明补充")
+
+    children = userInput.children or 0
+    elders = userInput.elders or 0
+    if origin and userInput.destination and origin != userInput.destination and days <= 1:
+        _append_warning(warnings, "当天跨城往返可能较赶，建议预留交通时间或减少景点")
+    if (children > 0 or elders > 0) and (userInput.pace or "").lower() == "tight":
+        _append_warning(warnings, "行程节奏偏紧，亲子/老人出行建议减少移动与排队时间")
+
+    for di in range(1, days + 1):
+        total = sum(len(normalized[di][k]) for k in ("morning", "afternoon", "evening"))
+        if total >= 8:
+            _append_warning(warnings, f"Day{di} 地点较多，可能偏赶，可考虑删减或改为就近游")
+            break
+
+    score = 90
+    score -= 6 * len(warnings)
+    if trimmed_any:
+        score -= 5
+    if not ticket_names:
+        score -= 10
+    score = max(0, min(100, score))
+
+    meta = TripPlanMeta(
+        quality_score=score,
+        warnings=warnings[:5] if warnings else None,
+        fixed=_safe_unique_keep_order(fixed)[:8] if fixed else None,
+    )
+
+    new_itinerary: List[str] = []
+    for di in range(1, days + 1):
+        new_itinerary.append(f"Day{di} 上午：{'、'.join(normalized[di]['morning'])}")
+        new_itinerary.append(f"Day{di} 下午：{'、'.join(normalized[di]['afternoon'])}")
+        new_itinerary.append(f"Day{di} 晚上：{'、'.join(normalized[di]['evening'])}")
+
+    return tripPlan.model_copy(update={"summary": summary, "itinerary": new_itinerary, "meta": meta})
 
 
 def _http_get_json(base_url: str, params: Dict[str, str], timeout: float = 5.0):
@@ -542,6 +862,11 @@ def trip_plan(req: TripPlanRequest):
             opening_list=None,
             weather_daily=None,
             debug={"missing": missing},
+            meta=TripPlanMeta(
+                quality_score=20,
+                warnings=["信息不全，暂无法生成完整行程"],
+                fixed=["补齐三段"],
+            ),
         )
 
     # 更新并获取用户记忆（仅内存级，进程重启后会丢失）
@@ -619,7 +944,7 @@ def trip_plan(req: TripPlanRequest):
         tips="出发地填你的城市 → 目的地选机票+酒店或自由行 → 选3-4晚，看系统推荐酒店；航班尽量中午后到、次日午后返。",
     )
 
-    return TripPlanResponse(
+    plan = TripPlanResponse(
         mode=mode,
         summary=summary,
         inputs=req,
@@ -633,6 +958,8 @@ def trip_plan(req: TripPlanRequest):
         packages=packages,
         debug=debug,
     )
+
+    return postProcessTripPlan(plan, req)
 
 
 @router.post("/reverse_geocode", response_model=ReverseGeocodeResponse)
