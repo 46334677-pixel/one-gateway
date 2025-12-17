@@ -4,9 +4,10 @@ import re
 import urllib.parse
 import urllib.request
 import logging
+import uuid
 from typing import List, Dict, Any, Optional
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Response
 from pydantic import BaseModel, Field
 
 from app.llm_cn import (
@@ -18,6 +19,7 @@ from app.llm_cn import (
 )
 from app.routers.trip import TripPlanRequest, TripPlanResponse, trip_plan
 from app.routers import kb  # 新增：知识库
+from app.utils.date_range import extract_cn_date_range
 
 router = APIRouter(prefix="/cn/v1", tags=["trip_chat"])
 logger = logging.getLogger(__name__)
@@ -146,6 +148,18 @@ def _guess_preferences(text: str) -> List[str]:
             prefs.append(kw)
     return prefs
 
+def _valid_date_range(dr: Optional[List[str]]) -> bool:
+    if not dr or not isinstance(dr, list) or len(dr) != 2:
+        return False
+    try:
+        import datetime as dt
+
+        dt.date.fromisoformat(str(dr[0]))
+        dt.date.fromisoformat(str(dr[1]))
+        return True
+    except Exception:
+        return False
+
 def _fill_defaults(slots: TripPlanRequest) -> TripPlanRequest:
     data = slots.dict()
     # 日期范围兜底为空列表
@@ -267,7 +281,7 @@ def _kb_to_resources(kb_items):
 # ---------- 主流程 ----------
 # ---------- 主流程 ----------
 @router.post("/trip_chat", response_model=TripChatResponse)
-def trip_chat(req: TripChatRequest) -> TripChatResponse:
+def trip_chat(req: TripChatRequest, response: Response) -> TripChatResponse:
     """
     中文 TripChat 主流程：
     - 结合 origin / default_origin 补充出发地提示；
@@ -276,6 +290,9 @@ def trip_chat(req: TripChatRequest) -> TripChatResponse:
     - 尝试构造 TripPlanRequest 槽位并调用 trip_plan 生成行程；
     - 在 reply 中适当加上“草稿说明”，但 trip_plan 始终通过字段返回给前端。
     """
+    trace_id = uuid.uuid4().hex
+    response.headers["X-Trace-Id"] = trace_id
+
     # ----- 出发地提示 -----
     origin_hint = ""
     origin_value = req.origin
@@ -379,6 +396,17 @@ def trip_chat(req: TripChatRequest) -> TripChatResponse:
             elif req.default_origin:
                 slots.origin = req.default_origin
 
+        # ----- 4.1) 确定性日期解析：优先于 LLM（在缺字段判定之前写回 slots） -----
+        if not _valid_date_range(slots.date_range):
+            extracted = extract_cn_date_range(text_merge)
+            if extracted:
+                slots.date_range = [extracted["start_date"], extracted["end_date"]]
+                logger.info(
+                    "TripChat date_range extracted trace_id=%s date_range=%s",
+                    trace_id,
+                    slots.date_range,
+                )
+
     # ----- 5) 调 TripPlan：只要有 slots 就尝试调用，让 TripPlan 自己判断信息是否充分 -----
     trip_plan_result: Optional[TripPlanResponse] = None
     missing: List[str] = []
@@ -393,8 +421,21 @@ def trip_chat(req: TripChatRequest) -> TripChatResponse:
             logger.exception("TripChat: error when calling trip_plan")
             trip_plan_result = None
 
+    final_mode = trip_plan_result.mode if trip_plan_result is not None else "no-trip-plan"
+    logger.info(
+        "TripChat trace_id=%s user_text=%s slots.date_range=%s missing_fields=%s final_mode=%s",
+        trace_id,
+        req.input_text,
+        (slots.date_range if slots is not None else None),
+        missing,
+        final_mode,
+    )
+
     # ----- 6) 根据缺失字段增加“草稿说明”前缀（最多解释一次） -----
     if trip_plan_result is not None and missing:
+        # 文案互斥：如果仍缺“出行日期”，不要在同一回复里出现“已收到日期”之类表述
+        if "出行日期" in missing:
+            reply_text = re.sub(r"^.*?(已收到|收到).*(出行)?日期.*?$", "", reply_text, flags=re.MULTILINE).strip()
         draft_phrase = "我先按目前信息出了一版草稿"
         already_notified = any(
             (m.role == "assistant" and draft_phrase in (m.content or ""))
