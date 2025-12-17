@@ -80,6 +80,7 @@ class Packages(BaseModel):
 
 
 class TripPlanMeta(BaseModel):
+    trace_id: Optional[str] = None
     quality_score: Optional[int] = None  # 0-100
     warnings: Optional[List[str]] = None  # max 5
     fixed: Optional[List[str]] = None
@@ -425,7 +426,14 @@ def postProcessTripPlan(tripPlan: TripPlanResponse, userInput: TripPlanRequest) 
         score -= 10
     score = max(0, min(100, score))
 
+    trace_id = None
+    if tripPlan.meta and getattr(tripPlan.meta, "trace_id", None):
+        trace_id = tripPlan.meta.trace_id
+    if not trace_id:
+        trace_id = f"tp_{dt.datetime.utcnow().strftime('%Y%m%d%H%M%S')}_{os.urandom(3).hex()}"
+
     meta = TripPlanMeta(
+        trace_id=trace_id,
         quality_score=score,
         warnings=warnings[:5] if warnings else None,
         fixed=_safe_unique_keep_order(fixed)[:8] if fixed else None,
@@ -863,6 +871,7 @@ def trip_plan(req: TripPlanRequest):
             weather_daily=None,
             debug={"missing": missing},
             meta=TripPlanMeta(
+                trace_id=f"tp_{dt.datetime.utcnow().strftime('%Y%m%d%H%M%S')}_{os.urandom(3).hex()}",
                 quality_score=20,
                 warnings=["信息不全，暂无法生成完整行程"],
                 fixed=["补齐三段"],
