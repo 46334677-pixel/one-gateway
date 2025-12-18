@@ -17,9 +17,9 @@ from app.llm_cn import (
     SYSTEM_PROMPT,
     call_qwen_for_trip_chat,
 )
-from app.routers.trip import TripPlanRequest, TripPlanResponse, trip_plan
+from app.routers.trip import TripPlanRequest, TripPlanResponse, TripPlanMeta, trip_plan
 from app.routers import kb  # 新增：知识库
-from app.utils.date_range import extract_cn_date_range
+from app.utils.date_range import extract_cn_date_range, infer_cn_date_range_from_text
 
 router = APIRouter(prefix="/cn/v1", tags=["trip_chat"])
 logger = logging.getLogger(__name__)
@@ -186,8 +186,6 @@ def _missing_fields(slots: TripPlanRequest) -> List[str]:
         missing.append("出发地")
     if not slots.destination:
         missing.append("目的地")
-    if not slots.date_range:
-        missing.append("出行日期")
     if slots.adults is None and slots.people_count is None:
         missing.append("成人人数")
     return missing
@@ -292,6 +290,7 @@ def trip_chat(req: TripChatRequest, response: Response) -> TripChatResponse:
     """
     trace_id = uuid.uuid4().hex
     response.headers["X-Trace-Id"] = trace_id
+    date_hint_needed = False
 
     # ----- 出发地提示 -----
     origin_hint = ""
@@ -406,6 +405,22 @@ def trip_chat(req: TripChatRequest, response: Response) -> TripChatResponse:
                     trace_id,
                     slots.date_range,
                 )
+            else:
+                inferred = infer_cn_date_range_from_text(text_merge)
+                if inferred:
+                    slots.date_range = [inferred["start_date"], inferred["end_date"]]
+                    date_hint_needed = True
+                    logger.info(
+                        "TripChat date_range inferred trace_id=%s date_range=%s",
+                        trace_id,
+                        slots.date_range,
+                    )
+
+        # 只要是“节假日/元旦/周末”这类表达且没有明确日期范围，就加轻提示（不阻断生成）
+        if not extract_cn_date_range(text_merge) and re.search(
+            r"(元旦|节假日|周末|本周末|下周末|五一|劳动节|国庆|春节)", text_merge
+        ):
+            date_hint_needed = True
 
     # ----- 5) 调 TripPlan：只要有 slots 就尝试调用，让 TripPlan 自己判断信息是否充分 -----
     trip_plan_result: Optional[TripPlanResponse] = None
@@ -417,6 +432,21 @@ def trip_chat(req: TripChatRequest, response: Response) -> TripChatResponse:
         try:
             logger.info("TripChat: calling trip_plan with slots=%s", safe_slots.dict())
             trip_plan_result = trip_plan(safe_slots)
+
+            if trip_plan_result is not None and date_hint_needed:
+                msg = "未确认出行日期，营业时间/预约请以实际日期核对"
+                if trip_plan_result.meta is None:
+                    trip_plan_result.meta = TripPlanMeta(
+                        trace_id=f"tc_{trace_id}",
+                        quality_score=0,
+                        warnings=[msg],
+                        fixed=None,
+                    )
+                else:
+                    warnings = list(trip_plan_result.meta.warnings or [])
+                    if msg not in warnings:
+                        warnings.insert(0, msg)
+                    trip_plan_result.meta.warnings = warnings[:5]
         except Exception:
             logger.exception("TripChat: error when calling trip_plan")
             trip_plan_result = None

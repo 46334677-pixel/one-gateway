@@ -6,6 +6,7 @@ ROOT = os.path.abspath(os.path.join(HERE, ".."))
 sys.path.insert(0, ROOT)
 
 from app.utils.date_range import extract_cn_date_range  # noqa: E402
+from app.utils.date_range import infer_cn_date_range_from_text  # noqa: E402
 from app.routers.trip import TripPlanRequest  # noqa: E402
 
 
@@ -24,7 +25,15 @@ def main():
     req = TripPlanRequest(origin="上海", destination="上海", date_range=[dr["start_date"], dr["end_date"]])
     _assert(req.date_range and len(req.date_range) == 2, "TripPlanRequest date_range should be set")
 
-    print("date_range_selftest OK", dr)
+    inferred = infer_cn_date_range_from_text(
+        "元旦去大阪2天，带娃，想轻松",
+        now=__import__("datetime").datetime(2025, 12, 18, 12, 0, 0),
+    )
+    _assert(inferred is not None, "infer_cn_date_range_from_text should return non-empty dict")
+    _assert(inferred["start_date"] == "2026-01-01", "inferred start_date mismatch")
+    _assert(inferred["end_date"] == "2026-01-02", "inferred end_date mismatch")
+
+    print("date_range_selftest OK", {"extracted": dr, "inferred": inferred})
 
 
 if __name__ == "__main__":

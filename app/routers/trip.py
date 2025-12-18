@@ -299,6 +299,10 @@ def postProcessTripPlan(tripPlan: TripPlanResponse, userInput: TripPlanRequest) 
 
     if not ticket_names:
         _append_warning(warnings, "景点数据较少，本次为通用建议，可结合地图搜索补充")
+    if not userInput.date_range:
+        msg = "未确认出行日期，营业时间/预约请以实际日期核对"
+        if msg not in warnings:
+            warnings.insert(0, msg)
 
     parsed_days = _parse_itinerary_days(tripPlan.itinerary or [])
     used = set()
@@ -513,12 +517,6 @@ def _need_more_info(req: TripPlanRequest) -> List[str]:
     missing: List[str] = []
     if not req.destination:
         missing.append("目的地")
-    if not req.date_range:
-        missing.append("出行日期")
-    if req.adults is None and req.people_count is None:
-        missing.append("出行人数")
-    if not req.origin:
-        missing.append("出发地")
     return missing
 
 
