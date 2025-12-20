@@ -5,10 +5,10 @@ import urllib.parse
 import urllib.request
 import logging
 import uuid
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Union
 
 from fastapi import APIRouter, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict, root_validator, validator, field_validator
 
 from app.llm_cn import (
     ChatMessage,
@@ -75,9 +75,13 @@ def _enrich_spot(spot: Dict[str, Any], city: str) -> Dict[str, Any]:
 
 # ---------- 请求/响应模型 ----------
 class TripChatRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
     user_id: Optional[str] = None
     history: List[ChatMessage] = []
-    input_text: str
+    # FE minimal payload compatibility: accepts `text` and maps into `input_text`
+    text: Optional[str] = None
+    input_text: Optional[str] = None
+    slots: Optional["SlotsInput"] = None
     current_slots: Optional[TripPlanRequest] = None
     location_lat: Optional[float] = None
     location_lng: Optional[float] = None
@@ -87,6 +91,39 @@ class TripChatRequest(BaseModel):
     )
     user_lat: Optional[float] = None
     user_lng: Optional[float] = None
+
+    @root_validator(pre=True)
+    def _compat_text(cls, values):
+        if not isinstance(values, dict):
+            return values
+        if not values.get("input_text") and values.get("text"):
+            values["input_text"] = values.get("text")
+        return values
+
+    @validator("input_text")
+    def _input_text_required(cls, v):
+        s = "" if v is None else str(v)
+        if not s.strip():
+            raise ValueError("input_text is required")
+        return s
+
+
+class SlotsInput(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    date_range: Optional[Union[str, Dict[str, Any]]] = None
+
+    @field_validator("date_range", mode="before")
+    @classmethod
+    def normalize_date_range(cls, v):
+        if v is None:
+            return None
+        if isinstance(v, dict):
+            start = v.get("start_date") or v.get("start")
+            end = v.get("end_date") or v.get("end")
+            if start or end:
+                return [start, end]
+            return None
+        return v
 
 
 class TripChatResponse(BaseModel):
@@ -362,6 +399,21 @@ def trip_chat(req: TripChatRequest, response: Response) -> TripChatResponse:
         slots_from_llm = None
 
     slots: Optional[TripPlanRequest] = slots_from_llm or req.current_slots
+    if slots is None and req.slots is not None:
+        try:
+            raw_slots = req.slots.dict(exclude_none=True)
+            # normalize date_range if provided as string/dict
+            dr = raw_slots.get("date_range")
+            if isinstance(dr, str):
+                raw_slots["date_range"] = []
+            elif isinstance(dr, dict):
+                start = dr.get("start_date") or dr.get("start")
+                end = dr.get("end_date") or dr.get("end")
+                raw_slots["date_range"] = [start, end] if (start or end) else []
+            slots = TripPlanRequest.parse_obj(raw_slots)
+        except Exception:
+            logger.exception("TripChat: failed to parse req.slots")
+            slots = None
 
     # ----- 4) 猜槽位（目的地/天数/出发地/偏好），并与 slots 融合 -----
     guess_slots = TripPlanRequest()
