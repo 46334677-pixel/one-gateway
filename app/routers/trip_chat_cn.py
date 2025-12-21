@@ -7,7 +7,7 @@ import logging
 import uuid
 from typing import List, Dict, Any, Optional, Union
 
-from fastapi import APIRouter, Response
+from fastapi import APIRouter, Request, Response
 from pydantic import BaseModel, Field, ConfigDict, root_validator, validator, field_validator
 
 from app.llm_cn import (
@@ -316,7 +316,7 @@ def _kb_to_resources(kb_items):
 # ---------- 主流程 ----------
 # ---------- 主流程 ----------
 @router.post("/trip_chat", response_model=TripChatResponse)
-def trip_chat(req: TripChatRequest, response: Response) -> TripChatResponse:
+def trip_chat(req: TripChatRequest, response: Response, request: Request) -> TripChatResponse:
     """
     中文 TripChat 主流程：
     - 结合 origin / default_origin 补充出发地提示；
@@ -325,7 +325,7 @@ def trip_chat(req: TripChatRequest, response: Response) -> TripChatResponse:
     - 尝试构造 TripPlanRequest 槽位并调用 trip_plan 生成行程；
     - 在 reply 中适当加上“草稿说明”，但 trip_plan 始终通过字段返回给前端。
     """
-    trace_id = uuid.uuid4().hex
+    trace_id = getattr(request.state, "trace_id", None) or uuid.uuid4().hex
     response.headers["X-Trace-Id"] = trace_id
     date_hint_needed = False
 
@@ -483,7 +483,7 @@ def trip_chat(req: TripChatRequest, response: Response) -> TripChatResponse:
         missing = _missing_fields(safe_slots)
         try:
             logger.info("TripChat: calling trip_plan with slots=%s", safe_slots.dict())
-            trip_plan_result = trip_plan(safe_slots)
+            trip_plan_result = trip_plan(safe_slots, request)
 
             if trip_plan_result is not None and date_hint_needed:
                 msg = "未确认出行日期，营业时间/预约请以实际日期核对"

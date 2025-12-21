@@ -1,19 +1,22 @@
 import datetime as dt
 import json
 import os
+import logging
 import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
 from pydantic import BaseModel, Field
 
 from app.security import require_api_key
 
 router = APIRouter(prefix="/v1", tags=["trip"], dependencies=[Depends(require_api_key)])
+logger = logging.getLogger(__name__)
 
 
 class TripPlanRequest(BaseModel):
+    request_id: Optional[str] = Field(default=None, description="client request id")
     user_id: Optional[str] = Field(default=None, description="用户 ID，用于简单偏好记忆")
     origin: Optional[str] = Field(default=None, description="出发地")
     destination: Optional[str] = Field(default=None, description="目的地（可为空，表示本地游）")
@@ -80,6 +83,7 @@ class Packages(BaseModel):
 
 
 class TripPlanMeta(BaseModel):
+    request_id: Optional[str] = None
     trace_id: Optional[str] = None
     quality_score: Optional[int] = None  # 0-100
     warnings: Optional[List[str]] = None  # max 5
@@ -270,7 +274,9 @@ def _append_warning(warnings: List[str], msg: str):
     warnings.append(msg)
 
 
-def postProcessTripPlan(tripPlan: TripPlanResponse, userInput: TripPlanRequest) -> TripPlanResponse:
+def postProcessTripPlan(
+    tripPlan: TripPlanResponse, userInput: TripPlanRequest, trace_id: Optional[str] = None
+) -> TripPlanResponse:
     """
     Trip plan quality patch: normalize -> trim -> crowdFit -> sanityWarnings -> qualityScore.
     Keep existing field structures; only adds/updates `meta` and re-writes `itinerary` as List[str].
@@ -430,14 +436,19 @@ def postProcessTripPlan(tripPlan: TripPlanResponse, userInput: TripPlanRequest) 
         score -= 10
     score = max(0, min(100, score))
 
-    trace_id = None
+    request_id = getattr(userInput, "request_id", None)
+    if tripPlan.meta and getattr(tripPlan.meta, "request_id", None):
+        request_id = request_id or tripPlan.meta.request_id
+
+    trace_id_val = trace_id
     if tripPlan.meta and getattr(tripPlan.meta, "trace_id", None):
-        trace_id = tripPlan.meta.trace_id
-    if not trace_id:
-        trace_id = f"tp_{dt.datetime.utcnow().strftime('%Y%m%d%H%M%S')}_{os.urandom(3).hex()}"
+        trace_id_val = trace_id_val or tripPlan.meta.trace_id
+    if not trace_id_val:
+        trace_id_val = f"tp_{dt.datetime.utcnow().strftime('%Y%m%d%H%M%S')}_{os.urandom(3).hex()}"
 
     meta = TripPlanMeta(
-        trace_id=trace_id,
+        request_id=request_id or trace_id_val,
+        trace_id=trace_id_val,
         quality_score=score,
         warnings=warnings[:5] if warnings else None,
         fixed=_safe_unique_keep_order(fixed)[:8] if fixed else None,
@@ -850,8 +861,21 @@ def _build_itinerary(
 @router.post(
     "/trip_plan", response_model=TripPlanResponse, summary="出行规划（含营业时间/天气提示）"
 )
-def trip_plan(req: TripPlanRequest):
+def trip_plan(req: TripPlanRequest, request: Request):
+    trace_id = getattr(request.state, "trace_id", None)
+    if not trace_id:
+        trace_id = f"tp_{dt.datetime.utcnow().strftime('%Y%m%d%H%M%S')}_{os.urandom(3).hex()}"
+    request_id = req.request_id or trace_id
     mode = "dry-run" if req.dry_run or not req.confirm else "confirmed"
+
+    logger.info(
+        "trip_plan start trace_id=%s request_id=%s destination=%s date_range=%s mode=%s",
+        trace_id,
+        request_id,
+        req.destination,
+        req.date_range,
+        mode,
+    )
 
     # 必要信息不全时直接提示
     missing = _need_more_info(req)
@@ -869,7 +893,8 @@ def trip_plan(req: TripPlanRequest):
             weather_daily=None,
             debug={"missing": missing},
             meta=TripPlanMeta(
-                trace_id=f"tp_{dt.datetime.utcnow().strftime('%Y%m%d%H%M%S')}_{os.urandom(3).hex()}",
+                request_id=request_id,
+                trace_id=trace_id,
                 quality_score=20,
                 warnings=["信息不全，暂无法生成完整行程"],
                 fixed=["补齐三段"],
@@ -966,7 +991,17 @@ def trip_plan(req: TripPlanRequest):
         debug=debug,
     )
 
-    return postProcessTripPlan(plan, req)
+    processed = postProcessTripPlan(plan, req, trace_id=trace_id)
+    itinerary_len = len(processed.itinerary or [])
+    logger.info(
+        "trip_plan done trace_id=%s request_id=%s mode=%s itinerary_lines=%s warnings=%s",
+        processed.meta.trace_id if processed.meta else trace_id,
+        processed.meta.request_id if processed.meta else request_id,
+        processed.mode,
+        itinerary_len,
+        (processed.meta.warnings if processed.meta else []),
+    )
+    return processed
 
 
 @router.post("/reverse_geocode", response_model=ReverseGeocodeResponse)
