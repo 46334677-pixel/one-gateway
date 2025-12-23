@@ -80,6 +80,9 @@ SYSTEM_PROMPT = """
 注意：
 - 一定要返回合法 JSON，不能有注释，不能有多余的文本。
 - 如果暂时信息不够，不要强行凑 slots_json，should_call_trip_plan 设为 false 即可。
+- 禁止输出“我已经收到你的需求了/我已了解你的需求/收到”这类空话。
+- 如果信息不足，必须提出 2-4 个具体问题（目的地/日期/人数/预算/偏好/交通）。
+- 如果用户问“推荐/玩法/特色项目/滑雪/温泉”，必须给出不少于 5 条可执行建议，并再追问 2 个问题。
 """.strip()
 
 
@@ -172,7 +175,7 @@ def call_qwen_for_trip_chat(llm_input: TripChatLLMInput) -> TripChatLLMDecision:
     # 期望 content 是一个 JSON 字符串
     try:
         obj = json.loads(content)
-        reply = obj.get("reply") or "我已经收到你的需求了。"
+        reply = obj.get("reply") or ""
         should_call_trip_plan = bool(obj.get("should_call_trip_plan", False))
         confirm_real_world = bool(obj.get("confirm_real_world", False))
         slots = obj.get("slots_json", None)
