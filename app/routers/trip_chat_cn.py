@@ -252,6 +252,18 @@ def _missing_fields(slots: TripPlanRequest) -> List[str]:
     return missing
 
 
+# QUICK_REPLIES: 根据用户意图在缺少 destination 时给出候选
+def _dest_quick_replies(text: str) -> List[str]:
+    t = text or ""
+    if "东北" in t:
+        return ["哈尔滨", "长春", "沈阳", "大连", "长白山"]
+    if "新疆" in t:
+        return ["乌鲁木齐", "喀什", "伊犁", "阿勒泰"]
+    if "云南" in t:
+        return ["昆明", "大理", "丽江", "香格里拉", "西双版纳"]
+    return []
+
+
 def _is_generic_ack(text: str) -> bool:
     t = (text or "").strip()
     if not t:
@@ -632,11 +644,26 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
     # ----- 7) 最终 history：把本轮 assistant 回复加进去 -----
     new_history = history_with_new_user + [ChatMessage(role="assistant", content=reply_text)]
 
+    # QUICK_REPLIES: 若缺少目的地，返回候选给前端渲染 chips
+    quick_replies: List[str] = []
+    try:
+        if slots is None or not getattr(slots, "destination", None):
+            quick_replies = _dest_quick_replies(text_merge)
+    except Exception:
+        quick_replies = []
+
+    resources_out: Dict[str, Any] = resources_from_kb or {}
+    if quick_replies:
+        if not isinstance(resources_out, dict):
+            resources_out = {}
+        resources_out = dict(resources_out)
+        resources_out["quick_replies"] = quick_replies
+
     # ----- 8) 组装响应：resources_from_kb 和 trip_plan 一起返回 -----
     return TripChatResponse(
         reply=reply_text or "这边现在有点忙，你可以稍后再试试。",
         history=new_history,
         slots=slots,
         trip_plan=trip_plan_result,
-        resources=resources_from_kb,
+        resources=resources_out,
     )
