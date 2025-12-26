@@ -277,6 +277,42 @@ def _needs_recommendations(text: str) -> bool:
     return bool(re.search(r"(推荐|玩法|特色项目|项目|怎么?玩|攻略|安排|路线)", text or ""))
 
 
+def _classify_intent(text: str) -> str:
+    t = text or ""
+    if re.search(r"(??|?|??).*(??|??|??|??).*(??|??|??|??)", t):
+        return "plan"
+    if re.search(r"(??|???|??|???|??|??).*(??|???|??|??)", t):
+        return "explore"
+    return "chat"
+
+def _is_region_query(text: str) -> bool:
+    t = text or ""
+    has_region = bool(re.search(r"(??|??|??|??|??|??|??)", t))
+    has_query = bool(re.search(r"(??|??|???|??|??|???|??)", t))
+    return has_region and has_query
+
+def _pick_region(text: str) -> Optional[str]:
+    if "??" in (text or ""):
+        return "??"
+    return None
+
+def _build_region_overview(region: str) -> str:
+    if region != "??":
+        return ""
+    lines = [
+        "????????????????????????",
+        "?????????/????/??????",
+        "??????/??/??/?????",
+        "?????/????/????????",
+        "??????/????/??????",
+        "???????/????/?????",
+        "??????/???/?????",
+        "???????/???/????????????",
+        "??????????????????????????????",
+        "??????/??/??/??/????????????????????",
+    ]
+    return "\n".join(lines)
+
 def _count_actionable_items(text: str) -> int:
     lines = (text or "").splitlines()
     return sum(1 for line in lines if re.match(r"^\s*(?:\d+[.)、]|[-*•])", line.strip()))
@@ -573,43 +609,107 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
 
     # ----- 4.2) empty/generic reply fallback -----
     destination_value = slots.destination if slots is not None else None
+    intent = _classify_intent(req.input_text)
+    region = _pick_region(text_merge) if _is_region_query(text_merge) else None
+
+    generic_explore_reply = "\n".join([
+        "???? 3 ???????????",
+        "1???????????????/??/??/??????",
+        "2??????????????????",
+        "3????????????/????/????/???",
+        "??????????????????????",
+    ])
+
+    def _build_plan_followup_text() -> str:
+        if region == "??":
+            skeleton_lines = [
+                "????????????",
+                "A. ?????????-???/??-????????",
+                "B. ????????-??-????????",
+            ]
+        else:
+            skeleton_lines = [
+                "????????????",
+                "A. ??????????+???+????????",
+                "B. ????????/??/??+????????",
+            ]
+        questions = []
+        if not destination_value:
+            questions.append("????????")
+        if slots is None or not getattr(slots, "origin", None):
+            questions.append("?????")
+        if slots is None or not _valid_date_range(getattr(slots, "date_range", None)):
+            questions.append("????/???")
+        if slots is None or (
+            getattr(slots, "adults", None) is None and getattr(slots, "people_count", None) is None
+        ):
+            questions.append("???????")
+        if questions:
+            if len(questions) == 1:
+                skeleton_lines.append(f"?????{questions[0]}")
+            else:
+                skeleton_lines.append(f"?????{questions[0]}?{questions[1]}")
+        else:
+            skeleton_lines.append("?????????????????????")
+        return "\n".join(skeleton_lines)
+
     if _needs_recommendations(req.input_text):
         if destination_value:
             if _is_generic_ack(reply_text) or _count_actionable_items(reply_text) < 5:
                 reply_text = _build_reco_list(destination_value) + "\n\n" + _build_followup_questions(True)
         else:
-            reply_text = _build_followup_questions(False)
+            if intent == "explore" and region == "??":
+                reply_text = _build_region_overview("??")
+            elif intent == "plan":
+                reply_text = _build_plan_followup_text()
+            else:
+                reply_text = generic_explore_reply
     elif _is_generic_ack(reply_text):
-        reply_text = _build_followup_questions(bool(destination_value))
+        if intent == "explore" and not destination_value and region == "??":
+            reply_text = _build_region_overview("??")
+        elif intent == "plan":
+            reply_text = _build_plan_followup_text()
+        elif not destination_value:
+            reply_text = generic_explore_reply
+        else:
+            reply_text = _build_followup_questions(True)
 
-    # ----- 5) 调 TripPlan：只要有 slots 就尝试调用，让 TripPlan 自己判断信息是否充分 -----
+    # ----- 5) ? TripPlan????????????????? -----
     trip_plan_result: Optional[TripPlanResponse] = None
     missing: List[str] = []
 
-    if slots is not None:
+    if intent == "plan" and slots is not None:
         safe_slots = _fill_defaults(slots)
         missing = _missing_fields(safe_slots)
-        try:
-            logger.info("TripChat: calling trip_plan with slots=%s", safe_slots.dict())
-            trip_plan_result = trip_plan(safe_slots, request)
+        if not _valid_date_range(getattr(safe_slots, "date_range", None)) and "????" not in missing:
+            missing.append("????")
+        if missing:
+            reply_text = _build_plan_followup_text()
+        else:
+            try:
+                logger.info("TripChat: calling trip_plan with slots=%s", safe_slots.dict())
+                trip_plan_result = trip_plan(safe_slots, request)
 
-            if trip_plan_result is not None and date_hint_needed:
-                msg = "未确认出行日期，营业时间/预约请以实际日期核对"
-                if trip_plan_result.meta is None:
-                    trip_plan_result.meta = TripPlanMeta(
-                        trace_id=f"tc_{trace_id}",
-                        quality_score=0,
-                        warnings=[msg],
-                        fixed=None,
-                    )
-                else:
-                    warnings = list(trip_plan_result.meta.warnings or [])
-                    if msg not in warnings:
-                        warnings.insert(0, msg)
-                    trip_plan_result.meta.warnings = warnings[:5]
-        except Exception:
-            logger.exception("TripChat: error when calling trip_plan")
-            trip_plan_result = None
+                if trip_plan_result is not None and date_hint_needed:
+                    msg = "????????????/??????????"
+                    if trip_plan_result.meta is None:
+                        trip_plan_result.meta = TripPlanMeta(
+                            trace_id=f"tc_{trace_id}",
+                            quality_score=0,
+                            warnings=[msg],
+                            fixed=None,
+                        )
+                    else:
+                        warnings = list(trip_plan_result.meta.warnings or [])
+                        if msg not in warnings:
+                            warnings.insert(0, msg)
+                        trip_plan_result.meta.warnings = warnings[:5]
+            except Exception:
+                logger.exception("TripChat: error when calling trip_plan")
+                trip_plan_result = None
+    elif intent == "plan":
+        missing = ["???", "???"]
+        reply_text = _build_plan_followup_text()
 
     final_mode = trip_plan_result.mode if trip_plan_result is not None else "no-trip-plan"
     logger.info(
@@ -652,12 +752,9 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
     except Exception:
         quick_replies = []
 
-    resources_out: Dict[str, Any] = resources_from_kb or {}
+    resources_out: Dict[str, Any] = resources_from_kb if isinstance(resources_from_kb, dict) else {}
     if quick_replies:
-        if not isinstance(resources_out, dict):
-            resources_out = {}
-        resources_out = dict(resources_out)
-        resources_out["quick_replies"] = quick_replies
+        resources_out.setdefault("quick_replies", quick_replies)
 
     # ----- 8) 组装响应：resources_from_kb 和 trip_plan 一起返回 -----
     return TripChatResponse(
