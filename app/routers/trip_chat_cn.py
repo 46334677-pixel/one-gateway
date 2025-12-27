@@ -150,11 +150,19 @@ class TripChatResponse(BaseModel):
     slots: Optional[TripPlanRequest] = None
     trip_plan: Optional[TripPlanResponse] = None
     resources: Optional[Dict[str, Any]] = None  # 图文资源
+    mode: str = "EXPLORE"
     dialog_state: DialogState = DialogState.DISCOVERY
     slot_completeness: SlotCompleteness = Field(default_factory=SlotCompleteness)
     pending_questions: List[PendingQuestion] = Field(default_factory=list)
     next_action: NextAction = Field(default_factory=NextAction)
     trip_profile: Optional[TripProfile] = None
+
+
+class RouteOption(BaseModel):
+    title: str
+    days: Optional[int] = None
+    highlights: List[str] = Field(default_factory=list)
+    season_hint: Optional[str] = None
 
 
 # ---------- 工具：用户轮次与槽位猜测 ----------
@@ -471,6 +479,17 @@ def _question_id_for_slot(slot_key: str) -> str:
     return f"q_{slot_key}_v1"
 
 
+def _detect_mode(text: str, has_trip_plan: bool) -> str:
+    t = text or ""
+    if has_trip_plan and re.search(r"(更舒适|舒服点|别太赶|加|删|换酒店)", t):
+        return "REFINE"
+    if re.search(r"(介绍|推荐|特色|经典路线|怎么玩|有什么)", t):
+        return "EXPLORE"
+    if re.search(r"(行程|规划|安排|每天|路线|攻略)", t):
+        return "PLAN"
+    return "EXPLORE"
+
+
 def _detect_refine_intent(text: str) -> bool:
     t = text or ""
     return bool(
@@ -624,6 +643,47 @@ def _render_reply(
     if next_action.type == "CALL_TRIP_PLAN":
         return "\n".join(prefix_lines + ["我先出一版行程。", options])
     return "\n".join(prefix_lines + ["如果有其他偏好，也可以继续补充。", options])
+
+
+def _build_route_menu(destination: str, days: Optional[int], season_hint: Optional[str]) -> List[RouteOption]:
+    if destination != "东北":
+        return []
+    season = season_hint or ""
+    winter = "冬" in season or "雪" in season or "冰" in season
+    day_count = days or 5
+    options = [
+        RouteOption(
+            title="A 哈尔滨冰雪线",
+            days=day_count,
+            highlights=["中央大街", "索菲亚教堂", "冰雪大世界", "松花江"],
+            season_hint="冬季" if winter else None,
+        ),
+        RouteOption(
+            title="B 长白山温泉线",
+            days=day_count,
+            highlights=["长白山天池", "北坡/西坡", "温泉酒店", "雪景体验"],
+            season_hint="冬季" if winter else None,
+        ),
+        RouteOption(
+            title="C 哈尔滨+长白山混合线",
+            days=day_count,
+            highlights=["哈尔滨城市夜景", "长白山雪景", "温泉放松", "美食打卡"],
+            season_hint="冬季" if winter else None,
+        ),
+    ]
+    return options
+
+
+def _render_route_menu_text(options: List[RouteOption]) -> str:
+    if not options:
+        return ""
+    lines = ["先给你 3 条经典路线："]
+    for opt in options:
+        highlights = " / ".join(opt.highlights[:4])
+        days_txt = f"{opt.days}日" if opt.days else ""
+        lines.append(f"{opt.title}（{days_txt}）")
+        lines.append(f"亮点：{highlights}")
+    return "\n".join(lines)
 
 
 def _missing_fields(slots: TripPlanRequest) -> List[str]:
@@ -1096,14 +1156,27 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
                     reply_text = _build_reco_list(destination_value) + "\n\n" + _build_followup_questions(True)
         else:
             if intent == "explore" or (intent == "plan" and region):
-                reply_text = _build_region_overview(region) if region else generic_explore_reply
+                if region == "东北":
+                    route_menu = _build_route_menu("东北", _guess_days(req.input_text), req.input_text)
+                    menu_text = _render_route_menu_text(route_menu)
+                    if menu_text:
+                        reply_text = menu_text + "\n\n" + "你更想选哪条路线？"
+                    else:
+                        reply_text = _build_region_overview(region)
+                else:
+                    reply_text = _build_region_overview(region) if region else generic_explore_reply
             elif intent == "plan":
                 reply_text = _build_plan_followup_text()
             else:
                 reply_text = generic_explore_reply
     elif _is_generic_ack(reply_text):
         if (intent == "explore" or (intent == "plan" and region)) and not destination_value:
-            reply_text = _build_region_overview(region) if region else generic_explore_reply
+            if region == "东北":
+                route_menu = _build_route_menu("东北", _guess_days(req.input_text), req.input_text)
+                menu_text = _render_route_menu_text(route_menu)
+                reply_text = menu_text + "\n\n" + "你更想选哪条路线？" if menu_text else _build_region_overview(region)
+            else:
+                reply_text = _build_region_overview(region) if region else generic_explore_reply
         elif intent == "plan":
             reply_text = _build_plan_followup_text()
         elif not destination_value:
@@ -1205,6 +1278,15 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
         for item in quick_replies:
             if item not in existing:
                 existing.append(item)
+    if region == "东北" and intent == "explore":
+        menu_replies = ["选A", "选B", "选C", "我不确定"]
+        existing = resources_out.setdefault("quick_replies", [])
+        if not isinstance(existing, list):
+            existing = []
+            resources_out["quick_replies"] = existing
+        for item in menu_replies:
+            if item not in existing:
+                existing.append(item)
     if origin_conflict_note and getattr(slots, "origin", None) and req.origin:
         conflict_replies = [f"以{slots.origin}出发", f"改为{req.origin}出发"]
         existing = resources_out.setdefault("quick_replies", [])
@@ -1280,12 +1362,14 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
         )
     elif origin_conflict_note:
         reply_text = origin_conflict_note + ("\n" + reply_text if reply_text else "")
+    mode = _detect_mode(req.input_text, has_trip_plan)
     return TripChatResponse(
         reply=reply_text or "这边现在有点忙，你可以稍后再试试。",
         history=new_history,
         slots=slots,
         trip_plan=trip_plan_result,
         resources=resources_out,
+        mode=mode,
         dialog_state=dialog_state,
         slot_completeness=slot_completeness,
         pending_questions=pending_questions,
