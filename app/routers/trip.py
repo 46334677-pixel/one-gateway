@@ -30,6 +30,8 @@ class TripPlanRequest(BaseModel):
     interests: Optional[List[str]] = Field(default=None, description="兴趣偏好（旧字段）")
     preferences: Optional[List[str]] = Field(default=None, description="兴趣偏好（新字段）")
     pace: Optional[str] = Field(default=None, description="行程节奏：relaxed/normal/tight 等")
+    style: Optional[str] = Field(default=None, description="travel style")
+    pace_level: Optional[str] = Field(default=None, description="pace level")
 
     budget_cny: Optional[int] = Field(default=None, description="预算（元）")
     budget_level: Optional[str] = Field(default=None, description="预算档位：low/medium/high")

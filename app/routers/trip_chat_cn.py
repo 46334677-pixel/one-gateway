@@ -5,6 +5,7 @@ import re
 import urllib.parse
 import urllib.request
 import logging
+import time
 import uuid
 from typing import List, Dict, Any, Optional, Union
 
@@ -20,6 +21,13 @@ from app.llm_cn import (
 )
 from app.routers.trip import TripPlanRequest, TripPlanResponse, TripPlanMeta, trip_plan
 from app.routers import kb  # 新增：知识库
+from app.schemas.trip_dialog import (
+    DialogState,
+    TripProfile,
+    PendingQuestion,
+    SlotCompleteness,
+    NextAction,
+)
 from app.utils.date_range import extract_cn_date_range, infer_cn_date_range_from_text
 
 router = APIRouter(prefix="/cn/v1", tags=["trip_chat"])
@@ -142,6 +150,11 @@ class TripChatResponse(BaseModel):
     slots: Optional[TripPlanRequest] = None
     trip_plan: Optional[TripPlanResponse] = None
     resources: Optional[Dict[str, Any]] = None  # 图文资源
+    dialog_state: DialogState = DialogState.DISCOVERY
+    slot_completeness: SlotCompleteness = Field(default_factory=SlotCompleteness)
+    pending_questions: List[PendingQuestion] = Field(default_factory=list)
+    next_action: NextAction = Field(default_factory=NextAction)
+    trip_profile: Optional[TripProfile] = None
 
 
 # ---------- 工具：用户轮次与槽位猜测 ----------
@@ -239,6 +252,155 @@ def _fill_defaults(slots: TripPlanRequest) -> TripPlanRequest:
             data["children"] = 0
 
     return TripPlanRequest.parse_obj(data)
+
+
+def _parse_user_slots(text: str) -> Dict[str, Any]:
+    t = text or ""
+    result: Dict[str, Any] = {}
+
+    if re.search(r"(舒适|舒服点|品质点|别太省|不要太省)", t):
+        result["budget_level"] = "舒适"
+
+    m = re.search(r"(\d+)\s*(?:人|位|个)", t)
+    if m:
+        try:
+            result["traveler_count"] = max(1, min(int(m.group(1)), 20))
+        except Exception:
+            pass
+    else:
+        cn_map = {
+            "一": 1,
+            "二": 2,
+            "两": 2,
+            "三": 3,
+            "四": 4,
+            "五": 5,
+            "六": 6,
+            "七": 7,
+            "八": 8,
+            "九": 9,
+            "十": 10,
+        }
+        m_cn = re.search(r"([一二两三四五六七八九十])\s*(?:人|位|个)", t)
+        if m_cn:
+            result["traveler_count"] = cn_map.get(m_cn.group(1))
+
+    tags = []
+    tag_keywords = ["购物", "美食", "主题公园", "城市观光", "文化", "自然", "亲子"]
+    for kw in tag_keywords:
+        if kw in t and kw not in tags:
+            tags.append(kw)
+    if tags:
+        result["interest_tags"] = tags
+
+    return result
+
+
+def _merge_slots(prev_slots: Optional[TripPlanRequest], new_slots: Dict[str, Any]) -> TripPlanRequest:
+    slots = prev_slots or TripPlanRequest()
+    if not new_slots:
+        return slots
+
+    meta = getattr(slots, "_meta", None)
+    if not isinstance(meta, dict):
+        meta = {}
+    slot_sources = meta.get("slot_sources")
+    if not isinstance(slot_sources, dict):
+        slot_sources = {}
+
+    def _mark_source(key: str, value: Any):
+        slot_sources[key] = {
+            "value": value,
+            "source": "text",
+            "ts": int(time.time()),
+        }
+
+    budget_level = new_slots.get("budget_level")
+    if budget_level:
+        old_value = getattr(slots, "budget_level", None)
+        if old_value != budget_level:
+            _mark_source("budget_level", budget_level)
+        slots.budget_level = budget_level
+
+    traveler_count = new_slots.get("traveler_count")
+    if traveler_count:
+        old_value = getattr(slots, "people_count", None)
+        if old_value != traveler_count:
+            _mark_source("traveler_count", traveler_count)
+        slots.people_count = traveler_count
+
+    interest_tags = new_slots.get("interest_tags") or []
+    if interest_tags:
+        old_value = list(getattr(slots, "preferences", None) or [])
+        merged = []
+        for item in old_value + interest_tags:
+            if item and item not in merged:
+                merged.append(item)
+        if merged != old_value:
+            _mark_source("interest_tags", merged)
+        slots.preferences = merged
+
+    meta["slot_sources"] = slot_sources
+    setattr(slots, "_meta", meta)
+    return slots
+
+
+def _estimate_required_done(slots: Optional[TripPlanRequest]) -> int:
+    if slots is None:
+        return 0
+    done = 0
+    if getattr(slots, "origin", None):
+        done += 1
+    if getattr(slots, "destination", None):
+        done += 1
+    if _valid_date_range(getattr(slots, "date_range", None)):
+        done += 1
+    if getattr(slots, "people_count", None) is not None or getattr(slots, "adults", None) is not None:
+        done += 1
+    return done
+
+
+def _infer_profile_from_slots(slots: Optional[TripPlanRequest]) -> Optional[TripPlanRequest]:
+    if slots is None:
+        return None
+    tags = list(getattr(slots, "preferences", None) or []) or list(getattr(slots, "interests", None) or [])
+    tag_set = set(tags)
+    relax_tags = {"购物", "美食", "主题公园", "亲子"}
+
+    if tag_set.intersection(relax_tags):
+        if not getattr(slots, "style", None):
+            setattr(slots, "style", "休闲度假")
+        if not getattr(slots, "pace_level", None):
+            setattr(slots, "pace_level", "均衡偏轻松")
+
+    if getattr(slots, "budget_level", None) == "舒适" and not getattr(slots, "pace_level", None):
+        setattr(slots, "pace_level", "均衡")
+
+    return slots
+
+
+def _build_trip_profile(slots: Optional[TripPlanRequest]) -> TripProfile:
+    if slots is None:
+        return TripProfile()
+    traveler_count = None
+    if getattr(slots, "people_count", None) is not None:
+        traveler_count = int(getattr(slots, "people_count"))
+    else:
+        adults = getattr(slots, "adults", None) or 0
+        children = getattr(slots, "children", None) or 0
+        if adults or children:
+            traveler_count = int(adults + children)
+    return TripProfile(
+        origin_city=getattr(slots, "origin", None),
+        destination=getattr(slots, "destination", None),
+        date_range=getattr(slots, "date_range", None) or None,
+        traveler_count=traveler_count,
+        budget_level=getattr(slots, "budget_level", None),
+        interest_tags=list(getattr(slots, "preferences", None) or []),
+        pace_level=getattr(slots, "pace_level", None) or getattr(slots, "pace", None),
+        style=getattr(slots, "style", None),
+        slot_sources=(getattr(slots, "_meta", None) or {}).get("slot_sources"),
+    )
 
 
 def _missing_fields(slots: TripPlanRequest) -> List[str]:
@@ -632,6 +794,10 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
         ):
             date_hint_needed = True
 
+    # ----- 4.15) 解析用户显式槽位并合并 -----
+    slots = _merge_slots(slots, _parse_user_slots(req.input_text))
+    slots = _infer_profile_from_slots(slots)
+
     # ----- 4.2) empty/generic reply fallback -----
     destination_value = slots.destination if slots is not None else None
     intent = _classify_intent(req.input_text)
@@ -790,10 +956,20 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
                 existing.append(item)
 
     # ----- 8) 组装响应：resources_from_kb 和 trip_plan 一起返回 -----
+    slot_completeness = SlotCompleteness(
+        required_done=_estimate_required_done(slots),
+        required_total=4,
+    )
+    trip_profile = _build_trip_profile(slots)
     return TripChatResponse(
         reply=reply_text or "这边现在有点忙，你可以稍后再试试。",
         history=new_history,
         slots=slots,
         trip_plan=trip_plan_result,
         resources=resources_out,
+        dialog_state=DialogState.DISCOVERY,
+        slot_completeness=slot_completeness,
+        pending_questions=[],
+        next_action=NextAction(),
+        trip_profile=trip_profile,
     )
