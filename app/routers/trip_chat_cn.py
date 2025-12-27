@@ -301,7 +301,7 @@ def _merge_slots(prev_slots: Optional[TripPlanRequest], new_slots: Dict[str, Any
     if not new_slots:
         return slots
 
-    meta = getattr(slots, "_meta", None)
+    meta = getattr(slots, "meta", None)
     if not isinstance(meta, dict):
         meta = {}
     slot_sources = meta.get("slot_sources")
@@ -341,7 +341,7 @@ def _merge_slots(prev_slots: Optional[TripPlanRequest], new_slots: Dict[str, Any
         slots.preferences = merged
 
     meta["slot_sources"] = slot_sources
-    setattr(slots, "_meta", meta)
+    setattr(slots, "meta", meta)
     return slots
 
 
@@ -379,6 +379,141 @@ def _infer_profile_from_slots(slots: Optional[TripPlanRequest]) -> Optional[Trip
     return slots
 
 
+def _get_asked_slots(slots: Optional[TripPlanRequest]) -> List[Dict[str, Any]]:
+    if slots is None:
+        return []
+    meta = getattr(slots, "meta", None)
+    if not isinstance(meta, dict):
+        return []
+    asked = meta.get("asked_slots")
+    return asked if isinstance(asked, list) else []
+
+
+def _record_asked_slot(slots: Optional[TripPlanRequest], slot_key: str, qid: str, turn: int) -> None:
+    if slots is None:
+        return
+    meta = getattr(slots, "meta", None)
+    if not isinstance(meta, dict):
+        meta = {}
+    asked = meta.get("asked_slots")
+    if not isinstance(asked, list):
+        asked = []
+    asked.append({"slot_key": slot_key, "qid": qid, "turn": turn})
+    meta["asked_slots"] = asked[-20:]
+    setattr(slots, "meta", meta)
+
+
+def _slot_filled(slot_key: str, slots: Optional[TripPlanRequest], days_guess: Optional[int]) -> bool:
+    if slots is None:
+        return False
+    if slot_key == "traveler_count":
+        return getattr(slots, "people_count", None) is not None or getattr(slots, "adults", None) is not None
+    if slot_key == "days_or_date_range":
+        return _valid_date_range(getattr(slots, "date_range", None)) or bool(days_guess)
+    if slot_key == "destination":
+        return bool(getattr(slots, "destination", None))
+    if slot_key == "origin":
+        return bool(getattr(slots, "origin", None))
+    if slot_key == "budget_level":
+        return bool(getattr(slots, "budget_level", None))
+    if slot_key == "style":
+        return bool(getattr(slots, "style", None))
+    return False
+
+
+def _should_ask(
+    slot_key: str,
+    slots: Optional[TripPlanRequest],
+    history: List[ChatMessage],
+    current_turn: int,
+    days_guess: Optional[int],
+    max_turns: int = 10,
+) -> bool:
+    if _slot_filled(slot_key, slots, days_guess):
+        return False
+    for it in _get_asked_slots(slots):
+        if it.get("slot_key") == slot_key and current_turn - int(it.get("turn", 0)) <= max_turns:
+            return False
+
+    if history:
+        recent_assistant = [m for m in history if m.role == "assistant"][-max_turns:]
+        prompt_map = {
+            "traveler_count": "几位出行",
+            "days_or_date_range": "计划玩几天",
+            "destination": "目的地",
+            "origin": "出发",
+            "budget_level": "预算",
+            "style": "休闲度假",
+        }
+        marker = prompt_map.get(slot_key)
+        if marker and any(marker in (m.content or "") for m in recent_assistant):
+            return False
+
+    return True
+
+
+def _question_id_for_slot(slot_key: str) -> str:
+    return f"q_{slot_key}_v1"
+
+
+def _detect_refine_intent(text: str) -> bool:
+    t = text or ""
+    return bool(
+        re.search(
+            r"(更舒适|舒服点|别太赶|太赶|慢一点|节奏慢|加购物|加美食|加主题公园|删景点|删掉|减少景点|调整|改一下|优化|修改|微调)",
+            t,
+        )
+    )
+
+
+def _evaluate_missing_required(slots: Optional[TripPlanRequest], days_guess: Optional[int], has_user_origin: bool) -> List[str]:
+    missing: List[str] = []
+    traveler_count = getattr(slots, "people_count", None) if slots is not None else None
+    adults = getattr(slots, "adults", None) if slots is not None else None
+    has_traveler = traveler_count is not None or adults is not None
+    has_dates = False
+    if slots is not None and _valid_date_range(getattr(slots, "date_range", None)):
+        has_dates = True
+    if days_guess:
+        has_dates = True
+
+    destination_value = getattr(slots, "destination", None) if slots is not None else None
+
+    if not has_traveler:
+        missing.append("traveler_count")
+    if not has_dates:
+        missing.append("days_or_date_range")
+    if not destination_value:
+        missing.append("destination")
+    if not has_user_origin:
+        missing.append("origin")
+    return missing
+
+
+def _decide_next_action(missing_required: List[str]) -> NextAction:
+    if not missing_required:
+        return NextAction(type="CALL_TRIP_PLAN", reason="required_complete")
+    return NextAction(type="ASK", reason=f"missing_{missing_required[0]}")
+
+
+def _build_pending_question(missing_key: str) -> PendingQuestion:
+    question_id = _question_id_for_slot(missing_key)
+    prompts = {
+        "traveler_count": "几位出行？",
+        "days_or_date_range": "计划玩几天，或具体日期是哪几天？",
+        "destination": "这次想去哪个目的地？",
+        "origin": "从哪个城市出发？",
+    }
+    return PendingQuestion(
+        id=question_id,
+        question_id=question_id,
+        slot_key=missing_key,
+        prompt=prompts.get(missing_key, "请补充关键信息。"),
+        status="open",
+        asked_at=str(int(time.time())),
+    )
+
+
 def _build_trip_profile(slots: Optional[TripPlanRequest]) -> TripProfile:
     if slots is None:
         return TripProfile()
@@ -399,7 +534,7 @@ def _build_trip_profile(slots: Optional[TripPlanRequest]) -> TripProfile:
         interest_tags=list(getattr(slots, "preferences", None) or []),
         pace_level=getattr(slots, "pace_level", None) or getattr(slots, "pace", None),
         style=getattr(slots, "style", None),
-        slot_sources=(getattr(slots, "_meta", None) or {}).get("slot_sources"),
+        slot_sources=(getattr(slots, "meta", None) or {}).get("slot_sources"),
     )
 
 
@@ -530,15 +665,25 @@ def _build_reco_list(dest: str) -> str:
     )
 
 
+def _pick_followup_question(
+    slots: Optional[TripPlanRequest],
+    history: List[ChatMessage],
+    current_turn: int,
+    days_guess: Optional[int],
+) -> Optional[Dict[str, str]]:
+    candidates = [
+        ("style", "你更偏户外运动还是休闲度假？"),
+        ("budget_level", "预算大概什么档位（经济/舒适/高端）？"),
+    ]
+    for key, prompt in candidates:
+        if _should_ask(key, slots, history, current_turn, days_guess):
+            return {"slot_key": key, "prompt": prompt}
+    return None
+
+
 def _build_followup_questions(has_dest: bool) -> str:
     if has_dest:
-        return "\n".join(
-            [
-                "再确认两个点，我就能把安排做得更贴合：",
-                "A. 你更偏户外运动还是休闲度假？",
-                "B. 预算大概什么档位（经济/舒适/高端）？",
-            ]
-        )
+        return "如果有其他偏好，也可以继续补充。"
     return "\n".join(
         [
             "为了给你更准确的推荐，先确认 3 点：",
@@ -834,13 +979,10 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
         for label, needed in priorities:
             if needed:
                 questions.append(label)
-            if len(questions) >= 2:
+            if len(questions) >= 1:
                 break
         if questions:
-            if len(questions) == 1:
-                skeleton_lines.append(f"先确认：{questions[0]}。")
-            else:
-                skeleton_lines.append(f"先确认：{questions[0]}、{questions[1]}。")
+            skeleton_lines.append(f"先确认：{questions[0]}。")
         else:
             skeleton_lines.append("信息齐了，我可以开始生成行程。")
         return "\n".join(skeleton_lines)
@@ -848,7 +990,13 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
     if _needs_recommendations(req.input_text):
         if destination_value:
             if _is_generic_ack(reply_text) or _count_actionable_items(reply_text) < 5:
-                reply_text = _build_reco_list(destination_value) + "\n\n" + _build_followup_questions(True)
+                followup = _pick_followup_question(slots, history_with_new_user, user_turns, _guess_days(text_merge))
+                if followup:
+                    qid = _question_id_for_slot(followup["slot_key"])
+                    _record_asked_slot(slots, followup["slot_key"], qid, user_turns)
+                    reply_text = _build_reco_list(destination_value) + "\n\n" + followup["prompt"]
+                else:
+                    reply_text = _build_reco_list(destination_value) + "\n\n" + _build_followup_questions(True)
         else:
             if intent == "explore" or (intent == "plan" and region):
                 reply_text = _build_region_overview(region) if region else generic_explore_reply
@@ -864,7 +1012,13 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
         elif not destination_value:
             reply_text = generic_explore_reply
         else:
-            reply_text = _build_followup_questions(True)
+            followup = _pick_followup_question(slots, history_with_new_user, user_turns, _guess_days(text_merge))
+            if followup:
+                qid = _question_id_for_slot(followup["slot_key"])
+                _record_asked_slot(slots, followup["slot_key"], qid, user_turns)
+                reply_text = followup["prompt"]
+            else:
+                reply_text = _build_followup_questions(True)
 
     # ----- 5) TripPlan 触发条件判断 -----
     trip_plan_result: Optional[TripPlanResponse] = None
@@ -960,6 +1114,42 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
         required_done=_estimate_required_done(slots),
         required_total=4,
     )
+    days_guess = _guess_days(text_merge)
+    has_user_origin = bool(req.origin) or (
+        bool(getattr(slots, "origin", None)) and getattr(slots, "origin", None) != req.default_origin
+    )
+    missing_required = _evaluate_missing_required(slots, days_guess, has_user_origin)
+    has_trip_plan = trip_plan_result is not None
+    refine_intent = _detect_refine_intent(req.input_text)
+    if refine_intent and has_trip_plan:
+        dialog_state = DialogState.REFINEMENT
+    elif has_trip_plan:
+        dialog_state = DialogState.PLAN_PRESENTED
+    elif missing_required:
+        dialog_state = DialogState.DISCOVERY
+    else:
+        dialog_state = DialogState.PLAN_DRAFTING
+
+    next_action = NextAction(type="NONE", reason="not_plan")
+    pending_questions: List[PendingQuestion] = []
+    if refine_intent and has_trip_plan:
+        next_action = NextAction(type="REFINE_PLAN", reason="user_refine")
+    elif should_plan:
+        ask_key = None
+        for key in missing_required:
+            if _should_ask(key, slots, history_with_new_user, user_turns, days_guess):
+                ask_key = key
+                break
+        if ask_key is None:
+            if not missing_required:
+                next_action = NextAction(type="CALL_TRIP_PLAN", reason="required_complete")
+            else:
+                next_action = NextAction(type="NONE", reason="asked_recently")
+        else:
+            next_action = NextAction(type="ASK", reason=f"missing_{ask_key}")
+            pending_questions = [_build_pending_question(ask_key)]
+            _record_asked_slot(slots, ask_key, pending_questions[0].question_id, user_turns)
+            reply_text = pending_questions[0].prompt
     trip_profile = _build_trip_profile(slots)
     return TripChatResponse(
         reply=reply_text or "这边现在有点忙，你可以稍后再试试。",
@@ -967,9 +1157,9 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
         slots=slots,
         trip_plan=trip_plan_result,
         resources=resources_out,
-        dialog_state=DialogState.DISCOVERY,
+        dialog_state=dialog_state,
         slot_completeness=slot_completeness,
-        pending_questions=[],
-        next_action=NextAction(),
+        pending_questions=pending_questions,
+        next_action=next_action,
         trip_profile=trip_profile,
     )

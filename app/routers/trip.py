@@ -7,7 +7,7 @@ import urllib.request
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, Query, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 
 from app.security import require_api_key
 
@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 
 
 class TripPlanRequest(BaseModel):
+    model_config = ConfigDict(extra="allow", populate_by_name=True)
     request_id: Optional[str] = Field(default=None, description="client request id")
     user_id: Optional[str] = Field(default=None, description="用户 ID，用于简单偏好记忆")
     origin: Optional[str] = Field(default=None, description="出发地")
@@ -36,6 +37,7 @@ class TripPlanRequest(BaseModel):
     budget_cny: Optional[int] = Field(default=None, description="预算（元）")
     budget_level: Optional[str] = Field(default=None, description="预算档位：low/medium/high")
     notes: Optional[str] = Field(default=None, description="其他备注需求")
+    meta: Optional[Dict[str, Any]] = Field(default=None, alias="_meta")
 
     user_lat: Optional[float] = Field(default=None, description="用户当前纬度")
     user_lng: Optional[float] = Field(default=None, description="用户当前经度")

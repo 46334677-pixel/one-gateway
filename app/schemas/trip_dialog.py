@@ -44,6 +44,7 @@ class TripProfile(BaseModel):
 class PendingQuestion(BaseModel):
     model_config = ConfigDict(extra="allow")
     id: str
+    question_id: str
     slot_key: str
     prompt: str
     status: PendingQuestionStatus = PendingQuestionStatus.OPEN
