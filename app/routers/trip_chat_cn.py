@@ -256,7 +256,7 @@ def _missing_fields(slots: TripPlanRequest) -> List[str]:
 def _dest_quick_replies(text: str) -> List[str]:
     t = text or ""
     if "东北" in t:
-        return ["哈尔滨", "长春", "沈阳", "大连", "长白山"]
+        return ["哈尔滨", "长白山", "大连", "沈阳", "我还不确定"]
     if "新疆" in t:
         return ["乌鲁木齐", "喀什", "伊犁", "阿勒泰"]
     if "云南" in t:
@@ -279,39 +279,64 @@ def _needs_recommendations(text: str) -> bool:
 
 def _classify_intent(text: str) -> str:
     t = text or ""
-    if re.search(r"(??|?|??).*(??|??|??|??).*(??|??|??|??)", t):
-        return "plan"
-    if re.search(r"(??|???|??|???|??|??).*(??|???|??|??)", t):
+    is_plan = bool(re.search(r"(规划|行程|路线|安排|按天|几日游|生成行程|出行计划|行程表)", t))
+    is_explore = bool(re.search(r"(介绍|推荐|特色|怎么玩|必去|有哪些城市|景点|概览|对比)", t))
+    if is_explore:
+        if re.search(r"(生成|按天|安排|路线怎么走)", t):
+            return "plan"
         return "explore"
+    if is_plan:
+        return "plan"
     return "chat"
 
 def _is_region_query(text: str) -> bool:
     t = text or ""
-    has_region = bool(re.search(r"(??|??|??|??|??|??|??)", t))
-    has_query = bool(re.search(r"(??|??|???|??|??|???|??)", t))
+    has_region = bool(re.search(r"(东北|华北|华东|华中|华南|西北|西南|云南|新疆|海南)", t))
+    has_query = bool(re.search(r"(介绍|推荐|怎么玩|必去|有哪些|景点|概览|对比|路线|行程|几日游)", t))
     return has_region and has_query
 
 def _pick_region(text: str) -> Optional[str]:
-    if "??" in (text or ""):
-        return "??"
+    t = text or ""
+    if "东北" in t:
+        return "东北"
+    if "华北" in t:
+        return "华北"
+    if "华东" in t:
+        return "华东"
+    if "华中" in t:
+        return "华中"
+    if "华南" in t:
+        return "华南"
+    if "西北" in t:
+        return "西北"
+    if "西南" in t:
+        return "西南"
+    if "云南" in t:
+        return "云南"
+    if "新疆" in t:
+        return "新疆"
+    if "海南" in t:
+        return "海南"
     return None
 
 def _build_region_overview(region: str) -> str:
-    if region != "??":
+    if not region:
         return ""
-    lines = [
-        "????????????????????????",
-        "?????????/????/??????",
-        "??????/??/??/?????",
-        "?????/????/????????",
-        "??????/????/??????",
-        "???????/????/?????",
-        "??????/???/?????",
-        "???????/???/????????????",
-        "??????????????????????????????",
-        "??????/??/??/??/????????????????????",
-    ]
-    return "\n".join(lines)
+    if region == "东北":
+        return "\n".join(
+            [
+                "东北适合做冰雪、山林、滨海与城市历史的组合旅行，路程跨度大，通常需要在城市之间取舍。",
+                "方向参考：哈尔滨冰雪｜长白山雪景｜大连海滨｜沈阳历史｜延边美食。",
+                "你更偏好冰雪/自然，还是城市休闲？",
+            ]
+        )
+    return "\n".join(
+        [
+            f"{region}适合做多城市组合旅行，建议先确定偏好与出行时长再细化。",
+            "方向参考：城市文化｜自然山水｜海滨度假｜特色美食｜亲子休闲。",
+            "你更偏好哪一类？",
+        ]
+    )
 
 def _count_actionable_items(text: str) -> int:
     lines = (text or "").splitlines()
@@ -611,46 +636,47 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
     destination_value = slots.destination if slots is not None else None
     intent = _classify_intent(req.input_text)
     region = _pick_region(text_merge) if _is_region_query(text_merge) else None
+    should_plan = intent == "plan" and not (region and not destination_value)
 
-    generic_explore_reply = "\n".join([
-        "???? 3 ???????????",
-        "1???????????????/??/??/??????",
-        "2??????????????????",
-        "3????????????/????/????/???",
-        "??????????????????????",
-    ])
+    generic_explore_reply = "\n".join(
+        [
+            "先给你一个探索方向的概览：",
+            "1）核心城市打卡：地标 + 城市气质体验。",
+            "2）自然山水线：山林/湖海/国家公园。",
+            "3）美食与夜景线：本地必吃 + 夜市/夜景。",
+            "你更偏好哪一类，或计划玩几天？",
+        ]
+    )
 
     def _build_plan_followup_text() -> str:
-        if region == "??":
-            skeleton_lines = [
-                "????????????",
-                "A. ?????????-???/??-????????",
-                "B. ????????-??-????????",
-            ]
-        else:
-            skeleton_lines = [
-                "????????????",
-                "A. ??????????+???+????????",
-                "B. ????????/??/??+????????",
-            ]
+        skeleton_lines = [
+            "我可以帮你做行程规划，先补两点关键信息：",
+            "A. 目的地与出发地（若已确定其一可跳过）。",
+            "B. 出行日期与人数。",
+        ]
         questions = []
-        if not destination_value:
-            questions.append("????????")
-        if slots is None or not getattr(slots, "origin", None):
-            questions.append("?????")
-        if slots is None or not _valid_date_range(getattr(slots, "date_range", None)):
-            questions.append("????/???")
-        if slots is None or (
-            getattr(slots, "adults", None) is None and getattr(slots, "people_count", None) is None
-        ):
-            questions.append("???????")
+        priorities = [
+            ("目的地", not destination_value),
+            ("出行日期", slots is None or not _valid_date_range(getattr(slots, "date_range", None))),
+            (
+                "同行人数",
+                slots is None
+                or (getattr(slots, "adults", None) is None and getattr(slots, "people_count", None) is None),
+            ),
+            ("出发地", slots is None or not getattr(slots, "origin", None)),
+        ]
+        for label, needed in priorities:
+            if needed:
+                questions.append(label)
+            if len(questions) >= 2:
+                break
         if questions:
             if len(questions) == 1:
-                skeleton_lines.append(f"?????{questions[0]}")
+                skeleton_lines.append(f"先确认：{questions[0]}。")
             else:
-                skeleton_lines.append(f"?????{questions[0]}?{questions[1]}")
+                skeleton_lines.append(f"先确认：{questions[0]}、{questions[1]}。")
         else:
-            skeleton_lines.append("?????????????????????")
+            skeleton_lines.append("信息齐了，我可以开始生成行程。")
         return "\n".join(skeleton_lines)
 
     if _needs_recommendations(req.input_text):
@@ -658,15 +684,15 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
             if _is_generic_ack(reply_text) or _count_actionable_items(reply_text) < 5:
                 reply_text = _build_reco_list(destination_value) + "\n\n" + _build_followup_questions(True)
         else:
-            if intent == "explore" and region == "??":
-                reply_text = _build_region_overview("??")
+            if intent == "explore" or (intent == "plan" and region):
+                reply_text = _build_region_overview(region) if region else generic_explore_reply
             elif intent == "plan":
                 reply_text = _build_plan_followup_text()
             else:
                 reply_text = generic_explore_reply
     elif _is_generic_ack(reply_text):
-        if intent == "explore" and not destination_value and region == "??":
-            reply_text = _build_region_overview("??")
+        if (intent == "explore" or (intent == "plan" and region)) and not destination_value:
+            reply_text = _build_region_overview(region) if region else generic_explore_reply
         elif intent == "plan":
             reply_text = _build_plan_followup_text()
         elif not destination_value:
@@ -674,24 +700,25 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
         else:
             reply_text = _build_followup_questions(True)
 
-    # ----- 5) ? TripPlan????????????????? -----
+    # ----- 5) TripPlan 触发条件判断 -----
     trip_plan_result: Optional[TripPlanResponse] = None
     missing: List[str] = []
 
-    if intent == "plan" and slots is not None:
+    if should_plan and slots is not None:
         safe_slots = _fill_defaults(slots)
         missing = _missing_fields(safe_slots)
-        if not _valid_date_range(getattr(safe_slots, "date_range", None)) and "????" not in missing:
-            missing.append("????")
+        if not _valid_date_range(getattr(safe_slots, "date_range", None)) and "出行日期" not in missing:
+            missing.append("出行日期")
         if missing:
             reply_text = _build_plan_followup_text()
+            trip_plan_result = None
         else:
             try:
                 logger.info("TripChat: calling trip_plan with slots=%s", safe_slots.dict())
                 trip_plan_result = trip_plan(safe_slots, request)
 
                 if trip_plan_result is not None and date_hint_needed:
-                    msg = "????????????/??????????"
+                    msg = "你填写的是节假日/周末范围，如需更精确可补充具体日期"
                     if trip_plan_result.meta is None:
                         trip_plan_result.meta = TripPlanMeta(
                             trace_id=f"tc_{trace_id}",
@@ -707,8 +734,8 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
             except Exception:
                 logger.exception("TripChat: error when calling trip_plan")
                 trip_plan_result = None
-    elif intent == "plan":
-        missing = ["???", "???"]
+    elif should_plan:
+        missing = ["目的地", "出行日期"]
         reply_text = _build_plan_followup_text()
 
     final_mode = trip_plan_result.mode if trip_plan_result is not None else "no-trip-plan"
@@ -754,7 +781,13 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
 
     resources_out: Dict[str, Any] = resources_from_kb if isinstance(resources_from_kb, dict) else {}
     if quick_replies:
-        resources_out.setdefault("quick_replies", quick_replies)
+        existing = resources_out.setdefault("quick_replies", [])
+        if not isinstance(existing, list):
+            existing = []
+            resources_out["quick_replies"] = existing
+        for item in quick_replies:
+            if item not in existing:
+                existing.append(item)
 
     # ----- 8) 组装响应：resources_from_kb 和 trip_plan 一起返回 -----
     return TripChatResponse(
