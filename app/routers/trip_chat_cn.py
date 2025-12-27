@@ -379,6 +379,17 @@ def _infer_profile_from_slots(slots: Optional[TripPlanRequest]) -> Optional[Trip
     return slots
 
 
+def _set_origin_with_source(slots: TripPlanRequest, origin: str, source: str) -> None:
+    if not origin:
+        return
+    slots.origin = origin
+    meta = getattr(slots, "meta", None)
+    if not isinstance(meta, dict):
+        meta = {}
+    meta["origin_source"] = source
+    setattr(slots, "meta", meta)
+
+
 def _get_asked_slots(slots: Optional[TripPlanRequest]) -> List[Dict[str, Any]]:
     if slots is None:
         return []
@@ -398,6 +409,10 @@ def _record_asked_slot(slots: Optional[TripPlanRequest], slot_key: str, qid: str
     asked = meta.get("asked_slots")
     if not isinstance(asked, list):
         asked = []
+    for it in asked:
+        if it.get("slot_key") == slot_key and turn - int(it.get("turn", 0)) <= 10:
+            logger.warning("repeat_question_detected slot_key=%s turn=%s", slot_key, turn)
+            break
     asked.append({"slot_key": slot_key, "qid": qid, "turn": turn})
     meta["asked_slots"] = asked[-20:]
     setattr(slots, "meta", meta)
@@ -490,6 +505,16 @@ def _evaluate_missing_required(slots: Optional[TripPlanRequest], days_guess: Opt
     return missing
 
 
+def _set_meta_value(slots: Optional[TripPlanRequest], key: str, value: Any) -> None:
+    if slots is None:
+        return
+    meta = getattr(slots, "meta", None)
+    if not isinstance(meta, dict):
+        meta = {}
+    meta[key] = value
+    setattr(slots, "meta", meta)
+
+
 def _decide_next_action(missing_required: List[str]) -> NextAction:
     if not missing_required:
         return NextAction(type="CALL_TRIP_PLAN", reason="required_complete")
@@ -536,6 +561,69 @@ def _build_trip_profile(slots: Optional[TripPlanRequest]) -> TripProfile:
         style=getattr(slots, "style", None),
         slot_sources=(getattr(slots, "meta", None) or {}).get("slot_sources"),
     )
+
+
+def _summarize_known(
+    slots: Optional[TripPlanRequest],
+    days_guess: Optional[int],
+    has_user_origin: bool,
+) -> str:
+    parts: List[str] = []
+    if slots:
+        if getattr(slots, "destination", None):
+            parts.append(str(getattr(slots, "destination")))
+        if has_user_origin and getattr(slots, "origin", None):
+            parts.append(f"{getattr(slots, 'origin')}出发")
+        if _valid_date_range(getattr(slots, "date_range", None)):
+            parts.append("已定日期")
+        elif days_guess:
+            parts.append(f"{days_guess}天")
+        if getattr(slots, "people_count", None) is not None:
+            parts.append(f"{getattr(slots, 'people_count')}人")
+        elif getattr(slots, "adults", None) is not None:
+            parts.append("已有人数")
+        if getattr(slots, "pace_level", None):
+            parts.append("轻松节奏" if "轻松" in str(getattr(slots, "pace_level")) else "均衡节奏")
+        elif getattr(slots, "style", None) == "休闲度假":
+            parts.append("休闲度假")
+
+    summary = "已知：" + ("，".join(parts) if parts else "先了解需求")
+    return summary[:25]
+
+
+def _options_for_missing(missing_key: Optional[str]) -> str:
+    options_map = {
+        "traveler_count": "(1-2人/3-4人/5人以上/不确定)",
+        "days_or_date_range": "(2天/3天/4-5天/不确定)",
+        "destination": "(热门城市/周边/自然/不确定)",
+        "origin": "(本地出发/周边城市/不确定)",
+    }
+    return options_map.get(missing_key or "", "(可补充任意偏好)")
+
+
+def _render_reply(
+    slots: Optional[TripPlanRequest],
+    next_action: NextAction,
+    pending_questions: List[PendingQuestion],
+    days_guess: Optional[int],
+    has_user_origin: bool,
+    origin_conflict_note: Optional[str],
+) -> str:
+    summary = _summarize_known(slots, days_guess, has_user_origin)
+    missing_key = pending_questions[0].slot_key if pending_questions else None
+    options = _options_for_missing(missing_key)
+    prefix_lines = [summary]
+    if origin_conflict_note:
+        prefix_lines.append(origin_conflict_note)
+
+    if next_action.type == "ASK" and pending_questions:
+        question = pending_questions[0].prompt
+        return "\n".join(prefix_lines + [question, options])
+    if next_action.type == "REFINE_PLAN":
+        return "\n".join(prefix_lines + ["我先按你的调整优化行程。", options])
+    if next_action.type == "CALL_TRIP_PLAN":
+        return "\n".join(prefix_lines + ["我先出一版行程。", options])
+    return "\n".join(prefix_lines + ["如果有其他偏好，也可以继续补充。", options])
 
 
 def _missing_fields(slots: TripPlanRequest) -> List[str]:
@@ -890,6 +978,7 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
     # ----- 4) 猜槽位（目的地/天数/出发地/偏好），并与 slots 融合 -----
     guess_slots = TripPlanRequest()
     text_merge = req.input_text + "\n" + "\n".join([m.content for m in req.history if m.role == "user"])
+    text_origin = _guess_origin(req.input_text)
 
     guess_slots.destination = _guess_destination(text_merge)
     days = _guess_days(text_merge)
@@ -907,17 +996,19 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
     if slots is not None:
         if not getattr(slots, "destination", None) and getattr(guess_slots, "destination", None):
             slots.destination = guess_slots.destination
-        if not getattr(slots, "origin", None) and getattr(guess_slots, "origin", None):
-            slots.origin = guess_slots.origin
+        if text_origin:
+            _set_origin_with_source(slots, text_origin, "text")
+        elif not getattr(slots, "origin", None) and getattr(guess_slots, "origin", None):
+            _set_origin_with_source(slots, guess_slots.origin, "text")
         if not getattr(slots, "preferences", None) and getattr(guess_slots, "preferences", None):
             slots.preferences = guess_slots.preferences
 
         # 若仍无 origin，尝试用显式 origin 或 default_origin 补上
         if not getattr(slots, "origin", None):
             if origin_value:
-                slots.origin = origin_value
+                _set_origin_with_source(slots, origin_value, "location")
             elif req.default_origin:
-                slots.origin = req.default_origin
+                _set_origin_with_source(slots, req.default_origin, "location")
 
         # ----- 4.1) 确定性日期解析：优先在缺字段判定之前写回 slots -----
         if not _valid_date_range(getattr(slots, "date_range", None)):
@@ -948,6 +1039,12 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
     intent = _classify_intent(req.input_text)
     region = _pick_region(text_merge) if _is_region_query(text_merge) else None
     should_plan = intent == "plan" and not (region and not destination_value)
+    origin_conflict_note = ""
+    if slots is not None and req.origin and getattr(slots, "origin", None) and req.origin != slots.origin:
+        origin_conflict_note = (
+            f"我检测到你当前定位在{req.origin}，但你说从{slots.origin}出发。"
+            f"行程以{slots.origin}出发为准对吗？"
+        )
 
     generic_explore_reply = "\n".join(
         [
@@ -1108,6 +1205,15 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
         for item in quick_replies:
             if item not in existing:
                 existing.append(item)
+    if origin_conflict_note and getattr(slots, "origin", None) and req.origin:
+        conflict_replies = [f"以{slots.origin}出发", f"改为{req.origin}出发"]
+        existing = resources_out.setdefault("quick_replies", [])
+        if not isinstance(existing, list):
+            existing = []
+            resources_out["quick_replies"] = existing
+        for item in conflict_replies:
+            if item not in existing:
+                existing.append(item)
 
     # ----- 8) 组装响应：resources_from_kb 和 trip_plan 一起返回 -----
     slot_completeness = SlotCompleteness(
@@ -1121,6 +1227,8 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
     missing_required = _evaluate_missing_required(slots, days_guess, has_user_origin)
     has_trip_plan = trip_plan_result is not None
     refine_intent = _detect_refine_intent(req.input_text)
+    if refine_intent and has_trip_plan:
+        logger.info("refine_triggered trace_id=%s turn=%s", trace_id, user_turns)
     if refine_intent and has_trip_plan:
         dialog_state = DialogState.REFINEMENT
     elif has_trip_plan:
@@ -1145,12 +1253,33 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
                 next_action = NextAction(type="CALL_TRIP_PLAN", reason="required_complete")
             else:
                 next_action = NextAction(type="NONE", reason="asked_recently")
+                logger.warning(
+                    "repeat_question_detected trace_id=%s turn=%s missing_required=%s",
+                    trace_id,
+                    user_turns,
+                    ",".join(missing_required),
+                )
         else:
             next_action = NextAction(type="ASK", reason=f"missing_{ask_key}")
             pending_questions = [_build_pending_question(ask_key)]
             _record_asked_slot(slots, ask_key, pending_questions[0].question_id, user_turns)
-            reply_text = pending_questions[0].prompt
     trip_profile = _build_trip_profile(slots)
+    if has_trip_plan:
+        meta = getattr(slots, "meta", None) if slots is not None else None
+        if not isinstance(meta, dict) or meta.get("first_plan_turn") is None:
+            _set_meta_value(slots, "first_plan_turn", user_turns)
+            logger.info("turns_to_first_plan trace_id=%s turn=%s", trace_id, user_turns)
+    if should_plan and next_action.type in {"ASK", "CALL_TRIP_PLAN", "REFINE_PLAN"}:
+        reply_text = _render_reply(
+            slots,
+            next_action,
+            pending_questions,
+            days_guess,
+            has_user_origin,
+            origin_conflict_note,
+        )
+    elif origin_conflict_note:
+        reply_text = origin_conflict_note + ("\n" + reply_text if reply_text else "")
     return TripChatResponse(
         reply=reply_text or "这边现在有点忙，你可以稍后再试试。",
         history=new_history,
