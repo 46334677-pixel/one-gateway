@@ -1384,7 +1384,17 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
     _ = parsed_json  # 保留变量，避免未来扩展时误删
 
     # 只把“本轮用户消息”先加进 history，用于统计 user_turns
-    history_with_new_user = list(req.history) + [ChatMessage(role="user", content=req.input_text)]
+    history_with_new_user = list(req.history)
+    if not history_with_new_user:
+        history_with_new_user = [ChatMessage(role="user", content=req.input_text)]
+    else:
+        last = history_with_new_user[-1]
+        same_user = (
+            last.role == "user"
+            and (last.content or "").strip() == (req.input_text or "").strip()
+        )
+        if not same_user:
+            history_with_new_user.append(ChatMessage(role="user", content=req.input_text))
     user_turns = _count_user_turns(history_with_new_user)
     _ = user_turns  # 保留变量以避免未来逻辑改动时被误删
 
@@ -1492,6 +1502,63 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
     # ----- 4.15) 解析用户显式槽位并合并 -----
     slots = _merge_slots(slots, _parse_user_slots(req.input_text))
     slots = _infer_profile_from_slots(slots)
+
+    # ---- DialogDraft takeover (V1) ----
+    intent = _classify_intent(req.input_text)
+    region = _pick_region(text_merge) if _is_region_query(text_merge) else None
+    days_guess = _guess_days(text_merge)
+    has_user_origin = bool(req.origin) or (
+        bool(getattr(slots, "origin", None)) and getattr(slots, "origin", None) != req.default_origin
+    )
+    missing_required = _evaluate_missing_required(slots, days_guess, has_user_origin)
+    use_dialog = (
+        (intent in {"plan", "explore"} or _needs_recommendations(req.input_text))
+        and (missing_required or region)
+        and not _detect_refine_intent(req.input_text)
+    )
+    draft = None
+    if use_dialog:
+        ctx = _build_dialog_context(req, slots, intent, region, days_guess)
+        draft = _call_llm_for_dialog_draft(req, system_content, ctx)
+    logger.info(
+        "dialog_draft_takeover use_dialog=%s ok=%s trace_id=%s",
+        use_dialog,
+        draft is not None,
+        trace_id,
+    )
+    if use_dialog and draft is not None:
+        reply_text = _render_dialog_draft(draft)
+
+        resources_out = resources_from_kb if isinstance(resources_from_kb, dict) else {}
+        qrs = list(getattr(draft, "quick_replies", None) or [])
+        if qrs:
+            existing = resources_out.setdefault("quick_replies", [])
+            if not isinstance(existing, list):
+                existing = []
+                resources_out["quick_replies"] = existing
+            for x in qrs:
+                if x and x not in existing:
+                    existing.append(x)
+            resources_out["quick_replies"] = existing[:12]
+
+        new_history = list(history_with_new_user) + [ChatMessage(role="assistant", content=reply_text)]
+        slot_completeness = SlotCompleteness(
+            required_done=_estimate_required_done(slots),
+            required_total=4,
+        )
+        return TripChatResponse(
+            reply=reply_text,
+            history=new_history,
+            slots=slots,
+            trip_plan=None,
+            resources=resources_out,
+            mode="EXPLORE",
+            dialog_state=DialogState.DISCOVERY,
+            slot_completeness=slot_completeness,
+            pending_questions=[],
+            next_action=NextAction(type="ASK", reason="dialog_draft"),
+            trip_profile=_build_trip_profile(slots),
+        )
 
     # ----- 4.2) empty/generic reply fallback -----
     destination_value = slots.destination if slots is not None else None
