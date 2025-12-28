@@ -7,7 +7,7 @@ import urllib.request
 import logging
 import time
 import uuid
-from typing import List, Dict, Any, Optional, Union
+from typing import List, Dict, Any, Optional, Union, Tuple
 
 from fastapi import APIRouter, Request, Response
 from pydantic import BaseModel, Field, ConfigDict, root_validator, validator, field_validator
@@ -195,6 +195,243 @@ def _guess_destination(text: str) -> Optional[str]:
         return dest
 
     return None
+
+
+def _strip_admin_suffix(text: str) -> str:
+    if not text:
+        return ""
+    return re.sub(r"(市|区|县|省)$", "", text)
+
+
+def _normalize_dest_key(
+    text: str,
+    req_destination: Optional[str],
+    slots_destination: Optional[str],
+    region: Optional[str],
+) -> Optional[str]:
+    candidate = req_destination or slots_destination or None
+    candidate = _strip_admin_suffix(candidate or "")
+    if not candidate:
+        candidate = _guess_destination(text or "")
+    if not candidate and region:
+        candidate = _strip_admin_suffix(region)
+
+    combined = f"{candidate} {text or ''} {region or ''}"
+    if any(k in combined for k in ("澳门", "香港", "港澳")):
+        return "港澳"
+    if any(k in combined for k in ("海南", "三亚", "海口", "万宁", "陵水", "文昌")):
+        return "海南"
+    if "东北" in combined:
+        return "东北"
+
+    if candidate:
+        return candidate
+    return None
+
+
+def _route_archetype(dest_key: Optional[str], text: str, region: Optional[str]) -> str:
+    if dest_key == "东北":
+        return "NORTHEAST_SNOW"
+    if dest_key == "港澳":
+        return "HK_MO"
+    if dest_key == "海南":
+        return "HAINAN_ISLAND"
+
+    t = text or ""
+    if re.search(r"(美食|夜宵|小吃|吃什么|必吃|探店)", t):
+        return "FOOD_CITY"
+    if dest_key in {"成都", "重庆", "长沙", "广州", "顺德", "潮汕", "武汉"}:
+        return "FOOD_CITY"
+
+    if re.search(r"(博物馆|历史|古城|人文|遗址|古都)", t):
+        return "HISTORY_CITY"
+    if dest_key in {"北京", "西安", "南京", "洛阳", "开封"}:
+        return "HISTORY_CITY"
+
+    if dest_key:
+        return "CITY_BREAK"
+    return "GENERIC"
+
+
+def _render_actions_starter(
+    archetype: str,
+    dest_key: Optional[str],
+    days: Optional[int],
+    origin_hint: Optional[str],
+    text: Optional[str] = None,
+) -> Tuple[str, List[str]]:
+    hook = "先给你一个更清晰的选择框架，方便快速定方向。"
+    dest_text = dest_key or "目的地"
+    days_text = f"{days}天" if days else "几天"
+    origin_text = f"从{origin_hint}出发" if origin_hint else "出发地未定"
+    confirm = f"先按{dest_text}{days_text}的思路给你三种经典走法（{origin_text}）。"
+
+    options: List[str]
+    advice: str
+    questions: List[str]
+    quick_replies: List[str]
+
+    text_hint = text or ""
+    if archetype == "GENERIC":
+        options = [
+            "经典打卡线｜适合：第一次来 | 亮点：地标/老街/夜景 | 节奏：适中 | 避坑：错峰出行",
+            "轻松度假线｜适合：想放松 | 亮点：酒店/咖啡/温泉 | 节奏：轻松 | 避坑：减少换酒店",
+            "亲子友好线｜适合：带娃 | 亮点：项目集中/午休友好 | 节奏：轻松 | 避坑：中午避晒",
+        ]
+        if days and days >= 3:
+            advice = "Advice：如果有 3 天游玩，更推荐轻松度假线。"
+        else:
+            advice = "Advice：如果只有 1-2 天，更推荐经典打卡线。"
+        questions = [
+            "Next：出行时间更接近哪类？（本周末/节假日/自定日期）",
+            "Next：同行结构更像哪种？（仅大人/亲子/含老人）",
+            "Next：希望整体节奏？（轻松/适中/偏赶）",
+        ]
+        quick_replies = [
+            "选经典",
+            "选度假",
+            "选亲子",
+            "本周末",
+            "节假日",
+            "自定日期",
+            "仅大人",
+            "亲子",
+            "含老人",
+            "轻松",
+            "适中",
+            "偏赶",
+            "我不确定",
+        ]
+    elif archetype == "NORTHEAST_SNOW":
+        options = [
+            "A 哈尔滨–亚布力–雪乡｜适合：第一次东北冰雪 | 亮点：冰雕/滑雪/雪景 | 节奏：适中 | 避坑：提前订住宿和车",
+            "B 长白山–二道白河–延吉｜适合：温泉+雪景 | 亮点：温泉/天池/延吉美食 | 节奏：适中 | 避坑：防寒与路况",
+            "C 沈阳–大连｜适合：城市人文 | 亮点：人文/海景/轻雪 | 节奏：轻松 | 避坑：行程别太赶",
+            "混合建议：哈尔滨(2)→亚布力(1)→长白山温泉(1)→返程(1)",
+        ]
+        advice = "Advice：首去东北更推荐 A 线，想温泉放松则选 B。"
+        questions = [
+            "Next：出行时间更接近哪类？（元旦/寒假/自定日期）",
+            "Next：同行结构是？（仅大人/亲子/含老人）",
+            "Next：行程重心选哪种？（滑雪为主/温泉为主/各一半）",
+        ]
+        quick_replies = [
+            "选A",
+            "选B",
+            "选C",
+            "选混合",
+            "我不确定",
+            "元旦",
+            "寒假",
+            "自定日期",
+            "滑雪为主",
+            "温泉为主",
+            "各一半",
+        ]
+    elif archetype == "HK_MO":
+        options = [
+            "澳门休闲线｜适合：想放松 | 亮点：老城+美食+酒店度假 | 节奏：轻松 | 避坑：错峰订酒店",
+            "香港城市线｜适合：城市探索 | 亮点：维港夜景+街区+观景点 | 节奏：适中 | 避坑：地铁通勤规划",
+            "港澳混合线｜适合：一次打卡 | 亮点：2+2 或 3+2 少折腾 | 节奏：适中 | 避坑：减少跨境次数",
+        ]
+        advice = "Advice：首次去港澳，默认建议港澳混合线。"
+        questions = [
+            "Next：是否购物/免税？（是/一般/不考虑）",
+            "Next：是否亲子或带老人？（是/否）",
+            "Next：节奏偏好？（轻松/适中）",
+        ]
+        quick_replies = [
+            "选澳门",
+            "选香港",
+            "选混合",
+            "购物是",
+            "购物一般",
+            "购物不",
+            "亲子",
+            "不亲子",
+            "轻松",
+            "适中",
+        ]
+    elif archetype == "HAINAN_ISLAND":
+        options = [
+            "三亚躺平度假｜适合：想放松 | 亮点：海景酒店+沙滩日落 | 节奏：轻松 | 避坑：少折腾",
+            "轻环线｜适合：想多看一点 | 亮点：三亚+万宁 或 海口+文昌 | 节奏：适中 | 避坑：减少搬家次数",
+            "亲子玩水｜适合：带娃 | 亮点：海边+室内备选+轻体力 | 节奏：轻松 | 避坑：防晒与休息",
+        ]
+        advice = "Advice：首次去海南，默认建议三亚躺平度假。"
+        questions = [
+            "Next：是否下水？（要/可能/不下水）",
+            "Next：酒店偏好？（海景/亲子设施/性价比）",
+            "Next：交通选择？（少折腾/更省）",
+        ]
+        quick_replies = [
+            "要",
+            "可能",
+            "不下水",
+            "海景",
+            "亲子设施",
+            "性价比",
+            "少折腾",
+            "更省",
+        ]
+    elif archetype == "CITY_BREAK":
+        options = [
+            f"{dest_text}名片线｜适合：第一次来 | 亮点：地标+老城+夜景 | 节奏：适中 | 避坑：错峰出行",
+            f"{dest_text}美食慢逛线｜适合：爱吃 | 亮点：小吃街+夜景街区+1个代表性景点 | 节奏：轻松 | 避坑：少换住宿",
+            f"{dest_text}亲子轻松线｜适合：带娃 | 亮点：公园/动物园/博物馆/室内备选 | 节奏：轻松 | 避坑：午后避晒",
+        ]
+        if re.search(r"吃", text_hint):
+            advice = "Advice：如果你更关注吃的，优先美食慢逛线。"
+        elif days and days <= 2:
+            advice = "Advice：如果只有 1-2 天，更推荐城市名片线。"
+        else:
+            advice = "Advice：默认先走城市名片线，信息补齐后再细化。"
+        questions = [
+            "Next：更偏住哪里？（市中心/景区附近/交通枢纽）",
+            "Next：同行结构是？（仅大人/亲子/含老人）",
+            "Next：更偏哪类？（拍照打卡/吃喝逛/文化深度）",
+        ]
+        quick_replies = [
+            "住市中心",
+            "住景区",
+            "住交通枢纽",
+            "仅大人",
+            "亲子",
+            "含老人",
+            "拍照",
+            "吃喝",
+            "文化",
+            "我不确定",
+        ]
+    else:
+        options = [
+            "方案A｜适合：第一次来 | 亮点：经典地标 | 节奏：适中 | 避坑：错峰出行",
+            "方案B｜适合：想放松 | 亮点：慢游体验 | 节奏：轻松 | 避坑：减少换酒店",
+            "方案C｜适合：想深度 | 亮点：主题小众 | 节奏：紧凑 | 避坑：预留交通",
+        ]
+        advice = "Advice：如果是第一次来，更推荐方案A。"
+        questions = [
+            "Next：你更偏好的节奏？（轻松/适中/紧凑）",
+            "Next：出行时间更接近哪类？（元旦/寒假/自定日期）",
+            "Next：是否有特殊偏好？（美食/亲子/人文/自然/我不确定）",
+        ]
+        quick_replies = [
+            "我不确定",
+            "轻松",
+            "适中",
+            "紧凑",
+            "元旦",
+            "寒假",
+            "自定日期",
+            "美食",
+            "亲子",
+            "人文",
+            "自然",
+        ]
+
+    options_block = "\n".join(["Options："] + [f"- {line}" for line in options])
+    reply_text = "\n".join([f"Hook：{hook}", f"Confirm：{confirm}", options_block, advice] + questions[:3])
+    return reply_text, quick_replies
 
 
 def _guess_days(text: str) -> Optional[int]:
@@ -722,6 +959,32 @@ def _needs_recommendations(text: str) -> bool:
     return bool(re.search(r"(推荐|玩法|特色项目|项目|怎么?玩|攻略|安排|路线)", text or ""))
 
 
+def _enforce_v1_actions_style(reply_text: str) -> str:
+    text = reply_text or ""
+    if not text.strip():
+        return text
+
+    lines = text.splitlines()
+    numbered = [idx for idx, line in enumerate(lines) if re.search(r"^\s*\d+[.、)]", line)]
+
+    if len(numbered) >= 4:
+        keep_questions = set(numbered[:3])
+        trimmed_lines = []
+        for idx, line in enumerate(lines):
+            if idx in keep_questions or idx not in numbered:
+                trimmed_lines.append(line)
+        prefix = "我先给你两个方向，你选完我再细化。"
+        return "\n".join([prefix] + [ln for ln in trimmed_lines if ln.strip()])
+
+    if re.search(r"(范围太大|范围较大|具体城市|请补充|补充.*(日期|人数|目的地))", text):
+        non_empty = [ln for ln in lines if ln.strip()]
+        if len(non_empty) <= 2 and not re.search(r"(Options|方案|线路|路线|卡)", text):
+            fallback_text, _ = _render_actions_starter("GENERIC", None, None, None, text="")
+            return fallback_text
+
+    return text
+
+
 def _classify_intent(text: str) -> str:
     t = text or ""
     is_plan = bool(re.search(r"(规划|行程|路线|安排|按天|几日游|生成行程|出行计划|行程表)", t))
@@ -1144,7 +1407,27 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
             skeleton_lines.append("信息齐了，我可以开始生成行程。")
         return "\n".join(skeleton_lines)
 
-    if _needs_recommendations(req.input_text):
+    actions_routed = False
+    actions_quick_replies: List[str] = []
+    days_guess_local = _guess_days(text_merge)
+    has_user_origin_local = bool(req.origin) or (
+        bool(getattr(slots, "origin", None)) and getattr(slots, "origin", None) != req.default_origin
+    )
+    missing_required_local = _evaluate_missing_required(slots, days_guess_local, has_user_origin_local)
+    actions_trigger = re.search(r"(几日游|几天|行程|路线|怎么?玩|推荐|攻略|特色|项目|安排)", req.input_text)
+    if actions_trigger and missing_required_local:
+        dest_key = _normalize_dest_key(text_merge, req.destination, destination_value, region)
+        archetype = _route_archetype(dest_key, text_merge, region)
+        reply_text, actions_quick_replies = _render_actions_starter(
+            archetype,
+            dest_key,
+            days_guess_local,
+            origin_value or req.default_origin or req.origin,
+            text=req.input_text,
+        )
+        actions_routed = True
+
+    if not actions_routed and _needs_recommendations(req.input_text):
         if destination_value:
             if _is_generic_ack(reply_text) or _count_actionable_items(reply_text) < 5:
                 followup = _pick_followup_question(slots, history_with_new_user, user_turns, _guess_days(text_merge))
@@ -1169,7 +1452,7 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
                 reply_text = _build_plan_followup_text()
             else:
                 reply_text = generic_explore_reply
-    elif _is_generic_ack(reply_text):
+    elif not actions_routed and _is_generic_ack(reply_text):
         if (intent == "explore" or (intent == "plan" and region)) and not destination_value:
             if region == "东北":
                 route_menu = _build_route_menu("东北", _guess_days(req.input_text), req.input_text)
@@ -1200,7 +1483,8 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
         if not _valid_date_range(getattr(safe_slots, "date_range", None)) and "出行日期" not in missing:
             missing.append("出行日期")
         if missing:
-            reply_text = _build_plan_followup_text()
+            if not actions_routed:
+                reply_text = _build_plan_followup_text()
             trip_plan_result = None
         else:
             try:
@@ -1226,7 +1510,8 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
                 trip_plan_result = None
     elif should_plan:
         missing = ["目的地", "出行日期"]
-        reply_text = _build_plan_followup_text()
+        if not actions_routed:
+            reply_text = _build_plan_followup_text()
 
     final_mode = trip_plan_result.mode if trip_plan_result is not None else "no-trip-plan"
     logger.info(
@@ -1258,9 +1543,6 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
 
         reply_text = prefix + "\n" + (reply_text or "")
 
-    # ----- 7) 最终 history：把本轮 assistant 回复加进去 -----
-    new_history = history_with_new_user + [ChatMessage(role="assistant", content=reply_text)]
-
     # QUICK_REPLIES: 若缺少目的地，返回候选给前端渲染 chips
     quick_replies: List[str] = []
     try:
@@ -1276,6 +1558,14 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
             existing = []
             resources_out["quick_replies"] = existing
         for item in quick_replies:
+            if item not in existing:
+                existing.append(item)
+    if actions_quick_replies:
+        existing = resources_out.setdefault("quick_replies", [])
+        if not isinstance(existing, list):
+            existing = []
+            resources_out["quick_replies"] = existing
+        for item in actions_quick_replies:
             if item not in existing:
                 existing.append(item)
     if region == "东北" and intent == "explore":
@@ -1324,7 +1614,7 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
     pending_questions: List[PendingQuestion] = []
     if refine_intent and has_trip_plan:
         next_action = NextAction(type="REFINE_PLAN", reason="user_refine")
-    elif should_plan:
+    elif should_plan and not actions_routed:
         ask_key = None
         for key in missing_required:
             if _should_ask(key, slots, history_with_new_user, user_turns, days_guess):
@@ -1351,7 +1641,10 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
         if not isinstance(meta, dict) or meta.get("first_plan_turn") is None:
             _set_meta_value(slots, "first_plan_turn", user_turns)
             logger.info("turns_to_first_plan trace_id=%s turn=%s", trace_id, user_turns)
-    if should_plan and next_action.type in {"ASK", "CALL_TRIP_PLAN", "REFINE_PLAN"}:
+    if actions_routed:
+        next_action = NextAction(type="NONE", reason="actions_template")
+        pending_questions = []
+    if not actions_routed and should_plan and next_action.type in {"ASK", "CALL_TRIP_PLAN", "REFINE_PLAN"}:
         reply_text = _render_reply(
             slots,
             next_action,
@@ -1363,9 +1656,14 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
     elif origin_conflict_note:
         reply_text = origin_conflict_note + ("\n" + reply_text if reply_text else "")
     mode = _detect_mode(req.input_text, has_trip_plan)
+    reply_text = _enforce_v1_actions_style(reply_text)
+    final_reply = reply_text or "这边现在有点忙，你可以稍后再试试。"
+    final_history = history_with_new_user + [ChatMessage(role="assistant", content=final_reply)]
+    if final_history and final_history[-1].role == "assistant" and final_history[-1].content != final_reply:
+        logger.error("history_reply_mismatch trace_id=%s", trace_id)
     return TripChatResponse(
-        reply=reply_text or "这边现在有点忙，你可以稍后再试试。",
-        history=new_history,
+        reply=final_reply,
+        history=final_history,
         slots=slots,
         trip_plan=trip_plan_result,
         resources=resources_out,
