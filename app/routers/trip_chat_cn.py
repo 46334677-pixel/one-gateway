@@ -674,10 +674,16 @@ def _slot_filled(slot_key: str, slots: Optional[TripPlanRequest], days_guess: Op
         return _valid_date_range(getattr(slots, "date_range", None)) or bool(days_guess)
     if slot_key == "destination":
         return bool(getattr(slots, "destination", None))
+    if slot_key == "destination_city":
+        dest = getattr(slots, "destination", None)
+        return bool(dest) and not _is_region_destination_value(dest)
     if slot_key == "origin":
         return bool(getattr(slots, "origin", None))
     if slot_key == "budget_level":
         return bool(getattr(slots, "budget_level", None))
+    if slot_key == "preferences":
+        prefs = list(getattr(slots, "preferences", None) or []) or list(getattr(slots, "interests", None) or [])
+        return bool(prefs)
     if slot_key == "style":
         return bool(getattr(slots, "style", None))
     return False
@@ -703,8 +709,10 @@ def _should_ask(
             "traveler_count": "几位出行",
             "days_or_date_range": "计划玩几天",
             "destination": "目的地",
+            "destination_city": "哪个城市",
             "origin": "出发",
             "budget_level": "预算",
+            "preferences": "偏好",
             "style": "休闲度假",
         }
         marker = prompt_map.get(slot_key)
@@ -785,7 +793,10 @@ def _build_pending_question(missing_key: str) -> PendingQuestion:
         "traveler_count": "几位出行？",
         "days_or_date_range": "计划玩几天，或具体日期是哪几天？",
         "destination": "这次想去哪个目的地？",
+        "destination_city": "你更想去哪个城市？",
         "origin": "从哪个城市出发？",
+        "budget_level": "预算大概什么档位？",
+        "preferences": "你更偏好哪类玩法？",
     }
     return PendingQuestion(
         id=question_id,
@@ -854,7 +865,10 @@ def _options_for_missing(missing_key: Optional[str]) -> str:
         "traveler_count": "(1-2人/3-4人/5人以上/不确定)",
         "days_or_date_range": "(2天/3天/4-5天/不确定)",
         "destination": "(热门城市/周边/自然/不确定)",
+        "destination_city": "(哈尔滨/长白山/大连/沈阳/不确定)",
         "origin": "(本地出发/周边城市/不确定)",
+        "budget_level": "(经济/舒适/高端/不确定)",
+        "preferences": "(滑雪/温泉/美食/自然/不确定)",
     }
     return options_map.get(missing_key or "", "(可补充任意偏好)")
 
@@ -948,6 +962,65 @@ def _dest_quick_replies(text: str) -> List[str]:
     return []
 
 
+REGION_KEYWORDS = [
+    "东北",
+    "华北",
+    "华东",
+    "华南",
+    "西北",
+    "西南",
+    "川西",
+    "江浙沪",
+    "大湾区",
+    "长三角",
+    "珠三角",
+    "华中",
+    "新疆",
+    "内蒙",
+    "青甘",
+    "西北地区",
+    "西南地区",
+]
+
+REGION_CITY_CANDIDATES = {
+    "东北": ["哈尔滨", "长春", "沈阳", "大连", "长白山"],
+    "华东": ["上海", "杭州", "苏州", "南京", "厦门"],
+    "西南": ["成都", "重庆", "昆明", "丽江", "西双版纳"],
+    "西北": ["西安", "兰州", "西宁", "张掖", "敦煌"],
+    "青甘": ["西宁", "张掖", "敦煌", "青海湖", "茶卡盐湖"],
+    "大湾区": ["深圳", "广州", "珠海", "中山", "佛山"],
+    "江浙沪": ["上海", "杭州", "苏州", "南京", "无锡"],
+    "长三角": ["上海", "杭州", "苏州", "南京", "无锡"],
+    "珠三角": ["深圳", "广州", "珠海", "中山", "佛山"],
+    "川西": ["成都", "稻城亚丁", "康定", "四姑娘山", "色达"],
+    "新疆": ["乌鲁木齐", "喀什", "伊犁", "吐鲁番", "阿勒泰"],
+    "内蒙": ["呼和浩特", "包头", "鄂尔多斯", "阿拉善", "满洲里"],
+}
+
+
+def _extract_region_from_text(text: str) -> Optional[str]:
+    t = text or ""
+    for key in REGION_KEYWORDS:
+        if key and key in t:
+            return key
+    return None
+
+
+def _is_region_destination_value(dest: Optional[str]) -> bool:
+    if not dest:
+        return False
+    return any(key in str(dest) for key in REGION_KEYWORDS)
+
+
+def _region_city_candidates(region: Optional[str]) -> List[str]:
+    if not region:
+        return []
+    for key, candidates in REGION_CITY_CANDIDATES.items():
+        if key in region:
+            return list(candidates)
+    return []
+
+
 def _is_generic_ack(text: str) -> bool:
     t = (text or "").strip()
     if not t:
@@ -1001,7 +1074,12 @@ def _classify_intent(text: str) -> str:
 
 def _is_region_query(text: str) -> bool:
     t = text or ""
-    has_region = bool(re.search(r"(东北|华北|华东|华中|华南|西北|西南|云南|新疆|海南)", t))
+    has_region = bool(
+        re.search(
+            r"(东北|华北|华东|华中|华南|西北|西南|川西|江浙沪|大湾区|长三角|珠三角|内蒙|青甘|西北地区|西南地区|云南|新疆|海南)",
+            t,
+        )
+    )
     has_query = bool(re.search(r"(介绍|推荐|怎么玩|必去|有哪些|景点|概览|对比|路线|行程|几日游)", t))
     return has_region and has_query
 
@@ -1021,6 +1099,24 @@ def _pick_region(text: str) -> Optional[str]:
         return "西北"
     if "西南" in t:
         return "西南"
+    if "川西" in t:
+        return "川西"
+    if "江浙沪" in t:
+        return "江浙沪"
+    if "大湾区" in t:
+        return "大湾区"
+    if "长三角" in t:
+        return "长三角"
+    if "珠三角" in t:
+        return "珠三角"
+    if "内蒙" in t:
+        return "内蒙"
+    if "青甘" in t:
+        return "青甘"
+    if "西北地区" in t:
+        return "西北地区"
+    if "西南地区" in t:
+        return "西南地区"
     if "云南" in t:
         return "云南"
     if "新疆" in t:
@@ -1051,6 +1147,74 @@ def _build_region_overview(region: str) -> str:
 def _count_actionable_items(text: str) -> int:
     lines = (text or "").splitlines()
     return sum(1 for line in lines if re.match(r"^\s*(?:\d+[.)、]|[-*•])", line.strip()))
+
+
+def _select_actions_question(
+    slots: Optional[TripPlanRequest],
+    text_merge: str,
+    days_guess: Optional[int],
+    history: List[ChatMessage],
+    current_turn: int,
+) -> Tuple[Optional[str], Optional[str], List[str], Optional[TripPlanRequest]]:
+    destination_value = getattr(slots, "destination", None) if slots is not None else None
+    region_value = destination_value if _is_region_destination_value(destination_value) else None
+
+    if not destination_value:
+        region_hit = _extract_region_from_text(text_merge)
+        if region_hit:
+            region_value = region_hit
+            if slots is None:
+                slots = TripPlanRequest()
+            slots.destination = region_hit
+            destination_value = region_hit
+
+    candidates = [
+        ("destination_city", region_value is not None),
+        ("destination", not destination_value),
+        ("days_or_date_range", not _valid_date_range(getattr(slots, "date_range", None)) and not days_guess),
+        (
+            "traveler_count",
+            getattr(slots, "people_count", None) is None and getattr(slots, "adults", None) is None,
+        ),
+        ("budget_level", not getattr(slots, "budget_level", None)),
+        (
+            "preferences",
+            not list(getattr(slots, "preferences", None) or []) and not list(getattr(slots, "interests", None) or []),
+        ),
+    ]
+
+    for slot_key, needed in candidates:
+        if not needed:
+            continue
+        if not _should_ask(slot_key, slots, history, current_turn, days_guess):
+            continue
+        if slot_key == "destination_city":
+            prompt = f"{region_value}范围比较大，你更想去哪个城市？点下面就行。"
+            quick_replies = _region_city_candidates(region_value)
+            quick_replies = (quick_replies or []) + ["我还不确定"]
+            return slot_key, prompt, quick_replies, slots
+        if slot_key == "destination":
+            prompt = "这次想去哪个城市？"
+            quick_replies = _dest_quick_replies(text_merge) or ["北京", "上海", "成都", "广州", "我还不确定"]
+            return slot_key, prompt, quick_replies, slots
+        if slot_key == "days_or_date_range":
+            prompt = "计划玩几天，或具体日期是哪几天？"
+            quick_replies = ["本周末", "下周末", "元旦", "春节", "2天", "3天", "4-5天", "我还不确定"]
+            return slot_key, prompt, quick_replies, slots
+        if slot_key == "traveler_count":
+            prompt = "几位出行？"
+            quick_replies = ["1人", "2人", "3人", "4人以上", "我还不确定"]
+            return slot_key, prompt, quick_replies, slots
+        if slot_key == "budget_level":
+            prompt = "预算大概什么档位？"
+            quick_replies = ["经济", "舒适", "高端", "我还不确定"]
+            return slot_key, prompt, quick_replies, slots
+        if slot_key == "preferences":
+            prompt = "你更偏好哪类玩法？"
+            quick_replies = ["滑雪", "温泉", "冰雕", "美食", "自然风光", "城市打卡", "我还不确定"]
+            return slot_key, prompt, quick_replies, slots
+
+    return None, None, [], slots
 
 
 def _build_reco_list(dest: str) -> str:
@@ -1511,6 +1675,58 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
         bool(getattr(slots, "origin", None)) and getattr(slots, "origin", None) != req.default_origin
     )
     missing_required = _evaluate_missing_required(slots, days_guess, has_user_origin)
+    actions_intent = (intent in {"plan", "explore"} or _needs_recommendations(req.input_text))
+    actions_slot_key, actions_prompt, actions_quick_replies, slots = _select_actions_question(
+        slots,
+        text_merge,
+        days_guess,
+        history_with_new_user,
+        user_turns,
+    )
+    if actions_intent and actions_prompt and not _detect_refine_intent(req.input_text):
+        qid = _question_id_for_slot(actions_slot_key)
+        pending_questions = [
+            PendingQuestion(
+                id=qid,
+                question_id=qid,
+                slot_key=actions_slot_key,
+                prompt=actions_prompt,
+                status="open",
+                asked_at=str(int(time.time())),
+            )
+        ]
+        _record_asked_slot(slots, actions_slot_key, qid, user_turns)
+
+        resources_out = resources_from_kb if isinstance(resources_from_kb, dict) else {}
+        if actions_quick_replies:
+            existing = resources_out.setdefault("quick_replies", [])
+            if not isinstance(existing, list):
+                existing = []
+                resources_out["quick_replies"] = existing
+            for item in actions_quick_replies:
+                if item and item not in existing:
+                    existing.append(item)
+            resources_out["quick_replies"] = existing[:12]
+
+        reply_text = actions_prompt
+        new_history = list(history_with_new_user) + [ChatMessage(role="assistant", content=reply_text)]
+        slot_completeness = SlotCompleteness(
+            required_done=_estimate_required_done(slots),
+            required_total=4,
+        )
+        return TripChatResponse(
+            reply=reply_text,
+            history=new_history,
+            slots=slots,
+            trip_plan=None,
+            resources=resources_out,
+            mode="EXPLORE",
+            dialog_state=DialogState.DISCOVERY,
+            slot_completeness=slot_completeness,
+            pending_questions=pending_questions,
+            next_action=NextAction(type="ASK", reason=f"missing_{actions_slot_key}"),
+            trip_profile=_build_trip_profile(slots),
+        )
     use_dialog = (
         (intent in {"plan", "explore"} or _needs_recommendations(req.input_text))
         and (missing_required or region)
