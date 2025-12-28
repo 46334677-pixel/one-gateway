@@ -27,6 +27,7 @@ from app.schemas.trip_dialog import (
     PendingQuestion,
     SlotCompleteness,
     NextAction,
+    DialogDraft,
 )
 from app.utils.date_range import extract_cn_date_range, infer_cn_date_range_from_text
 
@@ -203,30 +204,15 @@ def _strip_admin_suffix(text: str) -> str:
     return re.sub(r"(市|区|县|省)$", "", text)
 
 
-def _normalize_dest_key(
-    text: str,
-    req_destination: Optional[str],
-    slots_destination: Optional[str],
-    region: Optional[str],
-) -> Optional[str]:
-    candidate = req_destination or slots_destination or None
-    candidate = _strip_admin_suffix(candidate or "")
-    if not candidate:
-        candidate = _guess_destination(text or "")
-    if not candidate and region:
-        candidate = _strip_admin_suffix(region)
-
-    combined = f"{candidate} {text or ''} {region or ''}"
-    if any(k in combined for k in ("澳门", "香港", "港澳")):
-        return "港澳"
-    if any(k in combined for k in ("海南", "三亚", "海口", "万宁", "陵水", "文昌")):
-        return "海南"
-    if "东北" in combined:
+def _normalize_dest_key(destination: Optional[str], text_merge: str) -> Optional[str]:
+    text = text_merge or ""
+    if "东北" in text:
         return "东北"
-
-    if candidate:
-        return candidate
-    return None
+    if any(k in text for k in ("港澳", "澳门", "香港")):
+        return "港澳"
+    if any(k in text for k in ("海南", "三亚", "海口", "万宁", "陵水", "文昌", "琼海")):
+        return "海南"
+    return destination or None
 
 
 def _route_archetype(dest_key: Optional[str], text: str, region: Optional[str]) -> str:
@@ -538,6 +524,15 @@ def _parse_user_slots(text: str) -> Dict[str, Any]:
     if tags:
         result["interest_tags"] = tags
 
+    if re.search(r"(选A|A线|走A)", t, re.IGNORECASE):
+        result["route_choice"] = "A"
+    elif re.search(r"(选B|B线|走B)", t, re.IGNORECASE):
+        result["route_choice"] = "B"
+    elif re.search(r"(选C|C线|走C)", t, re.IGNORECASE):
+        result["route_choice"] = "C"
+    elif re.search(r"(混合|都想要|A和B)", t, re.IGNORECASE):
+        result["route_choice"] = "MIX"
+
     return result
 
 
@@ -584,6 +579,13 @@ def _merge_slots(prev_slots: Optional[TripPlanRequest], new_slots: Dict[str, Any
         if merged != old_value:
             _mark_source("interest_tags", merged)
         slots.preferences = merged
+
+    route_choice = new_slots.get("route_choice")
+    if route_choice:
+        old_choice = meta.get("route_choice")
+        if old_choice != route_choice:
+            _mark_source("route_choice", route_choice)
+        meta["route_choice"] = route_choice
 
     meta["slot_sources"] = slot_sources
     setattr(slots, "meta", meta)
@@ -1105,6 +1107,130 @@ def _build_followup_questions(has_dest: bool) -> str:
     )
 
 
+def _season_hint(text: str) -> str:
+    if re.search(r"(冬|雪|冰|元旦|寒假|12月|1月|2月)", text or ""):
+        return "winter"
+    return ""
+
+
+def _build_dialog_context(
+    req: TripChatRequest,
+    slots: Optional[TripPlanRequest],
+    intent: str,
+    region: Optional[str],
+    days_guess: Optional[int],
+) -> Dict[str, Any]:
+    destination = getattr(slots, "destination", None) if slots is not None else None
+    dest_key = _normalize_dest_key(destination, req.input_text)
+    origin = None
+    if slots is not None and getattr(slots, "origin", None):
+        origin = slots.origin
+    else:
+        origin = req.origin or req.default_origin
+
+    traveler = {
+        "people_count": getattr(slots, "people_count", None) if slots is not None else None,
+        "adults": getattr(slots, "adults", None) if slots is not None else None,
+        "children": getattr(slots, "children", None) if slots is not None else None,
+        "elders": getattr(slots, "elders", None) if slots is not None else None,
+    }
+    preferences = []
+    if slots is not None:
+        preferences = list(getattr(slots, "preferences", None) or []) or list(
+            getattr(slots, "interests", None) or []
+        )
+
+    return {
+        "dest_key": dest_key or region,
+        "origin": origin,
+        "days_guess": days_guess,
+        "date_range": getattr(slots, "date_range", None) if slots is not None else None,
+        "traveler": traveler,
+        "preferences": preferences,
+        "season_hint": _season_hint(req.input_text),
+        "intent": intent,
+        "note": "不要问超过3个问题，先给路线/方向菜单",
+    }
+
+
+def _force_dialog_draft_prompt(user_text: str, ctx: Dict[str, Any]) -> str:
+    ctx_json = json.dumps(ctx or {}, ensure_ascii=False)
+    return (
+        f"{user_text}\n"
+        "你是旅行助手，请严格输出 JSON-only（不要 Markdown、不要多余文字），结构如下：\n"
+        "{\n"
+        '  "hook": "...",\n'
+        '  "confirm": "...",\n'
+        '  "options": [\n'
+        '    {"key":"A","title":"...","fit_for":"...","highlights":["..."],"pace":["..."],"pitfalls":["..."] }\n'
+        "  ],\n"
+        '  "recommend_key":"A",\n'
+        '  "recommend_reason":"...",\n'
+        '  "questions":[\n'
+        '    {"key":"time","prompt":"...","options":["元旦","寒假","自定日期","我不确定"]}\n'
+        "  ],\n"
+        '  "next_step":"...",\n'
+        '  "quick_replies":["选A","选B","我不确定"]\n'
+        "}\n"
+        "规则：\n"
+        "- 先 options 再 questions\n"
+        "- options 2-4 个；每个 highlights 3-6，pace 2-4，pitfalls 0-3\n"
+        "- questions 0-3 个；每个 options 3-6 且包含“我不确定”\n"
+        "- quick_replies 需要包含：选A/选B/选C/选混合（当 dest_key 是区域/大范围如“东北/海南/港澳”时）\n"
+        "上下文（仅参考）：\n"
+        f"{ctx_json}\n"
+    )
+
+
+def _call_llm_for_dialog_draft(
+    req: TripChatRequest, system_prompt: str, ctx: Dict[str, Any]
+) -> Optional[DialogDraft]:
+    def _validate_draft(parsed: Dict[str, Any]) -> Optional[DialogDraft]:
+        if parsed is None:
+            return None
+        try:
+            return DialogDraft.model_validate(parsed)
+        except Exception:
+            try:
+                return DialogDraft.parse_obj(parsed)
+            except Exception:
+                return None
+
+    prompt = _force_dialog_draft_prompt(req.input_text, ctx)
+    decision = call_qwen_for_trip_chat(_build_llm_input(prompt, req, system_prompt))
+    parsed = _try_parse_json(decision.reply or "")
+    draft = _validate_draft(parsed)
+    if draft is not None:
+        return draft
+
+    retry_prompt = _force_dialog_draft_prompt(req.input_text, ctx) + "再次提醒：只输出 JSON。"
+    decision2 = call_qwen_for_trip_chat(_build_llm_input(retry_prompt, req, system_prompt))
+    parsed2 = _try_parse_json(decision2.reply or "")
+    return _validate_draft(parsed2)
+
+
+def _render_dialog_draft(draft: DialogDraft) -> str:
+    lines: List[str] = []
+    lines.append(draft.hook)
+    lines.append(draft.confirm)
+    lines.append("我先给你几个方向，你选完我再细化：")
+    for card in draft.options:
+        lines.append(f"【{card.key}】{card.title}")
+        lines.append(f"适合：{card.fit_for}")
+        lines.append("亮点：" + " / ".join(card.highlights))
+        lines.append("节奏：" + " / ".join(card.pace))
+        if card.pitfalls:
+            lines.append("避坑：" + " / ".join(card.pitfalls))
+    lines.append(f"推荐：我更建议选【{draft.recommend_key}】：{draft.recommend_reason}")
+    if draft.questions:
+        lines.append("再确认 2-3 个小问题，我就能给你出 5 日草稿：")
+        for idx, q in enumerate(draft.questions, 1):
+            opts = " / ".join(q.options)
+            lines.append(f"{idx}) {q.prompt}（{opts}）")
+    lines.append(draft.next_step)
+    return "\n".join([ln for ln in lines if (ln or "").strip()])
+
+
 # ---------- LLM 调用及解析 ----------
 def _build_llm_input(prompt: str, req: TripChatRequest, system_prompt: Optional[str] = None) -> TripChatLLMInput:
     lat = req.location_lat if req.location_lat is not None else req.user_lat
@@ -1298,6 +1424,16 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
             logger.exception("TripChat: failed to parse req.slots")
             slots = None
 
+    if req.destination:
+        if slots is None:
+            slots = TripPlanRequest()
+        slots.destination = req.destination
+        meta = getattr(slots, "meta", None)
+        if not isinstance(meta, dict):
+            meta = {}
+        meta["destination_source"] = "client"
+        setattr(slots, "meta", meta)
+
     # ----- 4) 猜槽位（目的地/天数/出发地/偏好），并与 slots 融合 -----
     guess_slots = TripPlanRequest()
     text_merge = req.input_text + "\n" + "\n".join([m.content for m in req.history if m.role == "user"])
@@ -1362,6 +1498,31 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
     intent = _classify_intent(req.input_text)
     region = _pick_region(text_merge) if _is_region_query(text_merge) else None
     should_plan = intent == "plan" and not (region and not destination_value)
+    days_guess = _guess_days(text_merge)
+    has_user_origin = bool(req.origin) or (
+        bool(getattr(slots, "origin", None)) and getattr(slots, "origin", None) != req.default_origin
+    )
+    missing_required = _evaluate_missing_required(slots, days_guess, has_user_origin)
+    refine_intent = _detect_refine_intent(req.input_text)
+    dest_key = _normalize_dest_key(destination_value or req.destination, text_merge)
+    use_dialog_draft = False
+    use_dialog_draft_success = False
+    dialog_quick_replies: List[str] = []
+    if (intent in {"plan", "explore"} or _needs_recommendations(req.input_text)) and not refine_intent:
+        if missing_required or region or dest_key in {"东北"}:
+            use_dialog_draft = True
+    if use_dialog_draft:
+        ctx = _build_dialog_context(req, slots, intent, region, days_guess)
+        draft = _call_llm_for_dialog_draft(req, system_content, ctx)
+        if draft is not None:
+            reply_text = _render_dialog_draft(draft)
+            dialog_quick_replies = list(draft.quick_replies or [])
+            use_dialog_draft_success = True
+    logger.info(
+        "dialog_draft_result trace_id=%s success=%s",
+        trace_id,
+        use_dialog_draft_success,
+    )
     origin_conflict_note = ""
     if slots is not None and req.origin and getattr(slots, "origin", None) and req.origin != slots.origin:
         origin_conflict_note = (
@@ -1409,25 +1570,19 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
 
     actions_routed = False
     actions_quick_replies: List[str] = []
-    days_guess_local = _guess_days(text_merge)
-    has_user_origin_local = bool(req.origin) or (
-        bool(getattr(slots, "origin", None)) and getattr(slots, "origin", None) != req.default_origin
-    )
-    missing_required_local = _evaluate_missing_required(slots, days_guess_local, has_user_origin_local)
     actions_trigger = re.search(r"(几日游|几天|行程|路线|怎么?玩|推荐|攻略|特色|项目|安排)", req.input_text)
-    if actions_trigger and missing_required_local:
-        dest_key = _normalize_dest_key(text_merge, req.destination, destination_value, region)
+    if actions_trigger and missing_required and not use_dialog_draft_success:
         archetype = _route_archetype(dest_key, text_merge, region)
         reply_text, actions_quick_replies = _render_actions_starter(
             archetype,
             dest_key,
-            days_guess_local,
+            days_guess,
             origin_value or req.default_origin or req.origin,
             text=req.input_text,
         )
         actions_routed = True
 
-    if not actions_routed and _needs_recommendations(req.input_text):
+    if not actions_routed and not use_dialog_draft_success and _needs_recommendations(req.input_text):
         if destination_value:
             if _is_generic_ack(reply_text) or _count_actionable_items(reply_text) < 5:
                 followup = _pick_followup_question(slots, history_with_new_user, user_turns, _guess_days(text_merge))
@@ -1452,7 +1607,7 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
                 reply_text = _build_plan_followup_text()
             else:
                 reply_text = generic_explore_reply
-    elif not actions_routed and _is_generic_ack(reply_text):
+    elif not actions_routed and not use_dialog_draft_success and _is_generic_ack(reply_text):
         if (intent == "explore" or (intent == "plan" and region)) and not destination_value:
             if region == "东北":
                 route_menu = _build_route_menu("东北", _guess_days(req.input_text), req.input_text)
@@ -1477,7 +1632,7 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
     trip_plan_result: Optional[TripPlanResponse] = None
     missing: List[str] = []
 
-    if should_plan and slots is not None:
+    if should_plan and slots is not None and not use_dialog_draft_success:
         safe_slots = _fill_defaults(slots)
         missing = _missing_fields(safe_slots)
         if not _valid_date_range(getattr(safe_slots, "date_range", None)) and "出行日期" not in missing:
@@ -1508,7 +1663,7 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
             except Exception:
                 logger.exception("TripChat: error when calling trip_plan")
                 trip_plan_result = None
-    elif should_plan:
+    elif should_plan and not use_dialog_draft_success:
         missing = ["目的地", "出行日期"]
         if not actions_routed:
             reply_text = _build_plan_followup_text()
@@ -1568,7 +1723,16 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
         for item in actions_quick_replies:
             if item not in existing:
                 existing.append(item)
-    if region == "东北" and intent == "explore":
+    if use_dialog_draft_success and dialog_quick_replies:
+        existing = resources_out.setdefault("quick_replies", [])
+        if not isinstance(existing, list):
+            existing = []
+            resources_out["quick_replies"] = existing
+        for item in dialog_quick_replies:
+            if item not in existing:
+                existing.append(item)
+        resources_out["quick_replies"] = existing[:12]
+    if region == "东北" and intent == "explore" and not use_dialog_draft_success:
         menu_replies = ["选A", "选B", "选C", "我不确定"]
         existing = resources_out.setdefault("quick_replies", [])
         if not isinstance(existing, list):
@@ -1586,19 +1750,17 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
         for item in conflict_replies:
             if item not in existing:
                 existing.append(item)
+    if use_dialog_draft_success:
+        existing = resources_out.get("quick_replies")
+        if isinstance(existing, list):
+            resources_out["quick_replies"] = existing[:12]
 
     # ----- 8) 组装响应：resources_from_kb 和 trip_plan 一起返回 -----
     slot_completeness = SlotCompleteness(
         required_done=_estimate_required_done(slots),
         required_total=4,
     )
-    days_guess = _guess_days(text_merge)
-    has_user_origin = bool(req.origin) or (
-        bool(getattr(slots, "origin", None)) and getattr(slots, "origin", None) != req.default_origin
-    )
-    missing_required = _evaluate_missing_required(slots, days_guess, has_user_origin)
     has_trip_plan = trip_plan_result is not None
-    refine_intent = _detect_refine_intent(req.input_text)
     if refine_intent and has_trip_plan:
         logger.info("refine_triggered trace_id=%s turn=%s", trace_id, user_turns)
     if refine_intent and has_trip_plan:
@@ -1614,7 +1776,7 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
     pending_questions: List[PendingQuestion] = []
     if refine_intent and has_trip_plan:
         next_action = NextAction(type="REFINE_PLAN", reason="user_refine")
-    elif should_plan and not actions_routed:
+    elif should_plan and not actions_routed and not use_dialog_draft_success:
         ask_key = None
         for key in missing_required:
             if _should_ask(key, slots, history_with_new_user, user_turns, days_guess):
@@ -1641,10 +1803,15 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
         if not isinstance(meta, dict) or meta.get("first_plan_turn") is None:
             _set_meta_value(slots, "first_plan_turn", user_turns)
             logger.info("turns_to_first_plan trace_id=%s turn=%s", trace_id, user_turns)
-    if actions_routed:
+    if actions_routed or use_dialog_draft_success:
         next_action = NextAction(type="NONE", reason="actions_template")
         pending_questions = []
-    if not actions_routed and should_plan and next_action.type in {"ASK", "CALL_TRIP_PLAN", "REFINE_PLAN"}:
+    if (
+        not actions_routed
+        and not use_dialog_draft_success
+        and should_plan
+        and next_action.type in {"ASK", "CALL_TRIP_PLAN", "REFINE_PLAN"}
+    ):
         reply_text = _render_reply(
             slots,
             next_action,
