@@ -13,6 +13,7 @@ class DialogState(str, Enum):
     PLAN_PRESENTED = "PLAN_PRESENTED"
     REFINEMENT = "REFINEMENT"
     CLOSING = "CLOSING"
+    PAUSED = "PAUSED"
 
 
 class PendingQuestionStatus(str, Enum):

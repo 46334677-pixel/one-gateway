@@ -1348,7 +1348,7 @@ def _force_dialog_draft_prompt(user_text: str, ctx: Dict[str, Any]) -> str:
 
 def _call_llm_for_dialog_draft(
     req: TripChatRequest, system_prompt: str, ctx: Dict[str, Any]
-) -> Optional[DialogDraft]:
+) -> Tuple[Optional[DialogDraft], Optional[str]]:
     def _validate_draft(parsed: Dict[str, Any]) -> Optional[DialogDraft]:
         if parsed is None:
             return None
@@ -1362,19 +1362,25 @@ def _call_llm_for_dialog_draft(
 
     prompt = _force_dialog_draft_prompt(req.input_text, ctx)
     decision = call_qwen_for_trip_chat(_build_llm_input(prompt, req, system_prompt))
-    parsed = _try_parse_json(decision.reply or "")
+    reply1 = decision.reply or ""
+    parsed = _try_parse_json(reply1)
     draft = _validate_draft(parsed)
     if draft is not None:
-        return draft
+        return draft, reply1
 
     retry_prompt = _force_dialog_draft_prompt(req.input_text, ctx) + "再次提醒：只输出 JSON。"
     decision2 = call_qwen_for_trip_chat(_build_llm_input(retry_prompt, req, system_prompt))
-    parsed2 = _try_parse_json(decision2.reply or "")
-    return _validate_draft(parsed2)
+    reply2 = decision2.reply or ""
+    parsed2 = _try_parse_json(reply2)
+    draft2 = _validate_draft(parsed2)
+    if draft2 is not None:
+        return draft2, reply2
+    return None, reply2 or reply1
 
 
 def _render_dialog_draft(draft: DialogDraft) -> str:
     lines: List[str] = []
+    lines.append("【路线选项】")
     lines.append(draft.hook)
     lines.append(draft.confirm)
     lines.append("我先给你几个方向，你选完我再细化：")
@@ -1448,6 +1454,55 @@ def _try_parse_json(txt: str) -> Optional[Dict[str, Any]]:
         except Exception:
             continue
     return None
+
+
+def _detect_interrupt_type(text: str) -> Optional[str]:
+    t = text or ""
+    if re.search(r"(讲个故事|来个故事|编个故事)", t):
+        return "story"
+    if re.search(r"(讲个笑话|来个笑话|逗我开心)", t):
+        return "joke"
+    if re.search(r"(心情不好|难受|焦虑|安慰我|鼓励我)", t):
+        return "comfort"
+    if re.search(r"(先不聊旅行|暂停|等会再说)", t):
+        return "pause"
+    return None
+
+
+def _build_interrupt_reply(kind: str) -> str:
+    if kind == "story":
+        return "\n".join(
+            [
+                "好呀，讲个温暖的小故事给你。",
+                "从前有一只小狐狸，走在雪地里迷了路。它沿着自己的脚印慢慢往回走，",
+                "途中遇到一只小鹿，小鹿说：“你看，雪地里每一步都算数。”",
+                "小狐狸一下就不慌了，原来每一次尝试都会留下方向。",
+                "你想听轻松一点的，还是更治愈一点的？",
+            ]
+        )
+    if kind == "joke":
+        return "\n".join(
+            [
+                "来个轻松的：",
+                "我朋友问我：旅行最怕什么？",
+                "我说：最怕行李箱打开的一瞬间，发现带了三件外套，却忘了充电器。",
+                "别急，我再给你讲一个更好笑的？",
+            ]
+        )
+    if kind == "comfort":
+        return "\n".join(
+            [
+                "听起来你现在不太好受，我在这儿陪你。",
+                "先做个小练习：慢慢吸气 4 秒，屏住 2 秒，再呼气 6 秒，重复 3 轮。",
+                "如果你愿意，也可以简单说说是什么让你难受，我会认真听。",
+            ]
+        )
+    return "\n".join(
+        [
+            "好的，我们先暂停旅行话题。",
+            "你想聊点别的，还是先安静一会儿？",
+        ]
+    )
 
 
 def _call_llm_for_json(req: TripChatRequest, system_prompt: Optional[str] = None):
@@ -1561,6 +1616,48 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
             history_with_new_user.append(ChatMessage(role="user", content=req.input_text))
     user_turns = _count_user_turns(history_with_new_user)
     _ = user_turns  # 保留变量以避免未来逻辑改动时被误删
+
+    # ----- 2.5) 中断/闲聊优先：先接话题，再决定是否继续规划 -----
+    interrupt_type = _detect_interrupt_type(req.input_text)
+    if interrupt_type:
+        reply_text = _build_interrupt_reply(interrupt_type)
+        resources_out = resources_from_kb if isinstance(resources_from_kb, dict) else {}
+        interrupt_replies = [
+            "继续规划",
+            "换个目的地",
+            "改预算档位",
+            "我想看路线选项",
+            "先聊聊天",
+            "稍后再说",
+        ]
+        existing = resources_out.setdefault("quick_replies", [])
+        if not isinstance(existing, list):
+            existing = []
+            resources_out["quick_replies"] = existing
+        for item in interrupt_replies:
+            if item not in existing:
+                existing.append(item)
+        resources_out["quick_replies"] = existing[:12]
+
+        slots = req.current_slots
+        slot_completeness = SlotCompleteness(
+            required_done=_estimate_required_done(slots),
+            required_total=4,
+        )
+        final_history = list(history_with_new_user) + [ChatMessage(role="assistant", content=reply_text)]
+        return TripChatResponse(
+            reply=reply_text,
+            history=final_history,
+            slots=slots,
+            trip_plan=None,
+            resources=resources_out,
+            mode="EXPLORE",
+            dialog_state=DialogState.PAUSED,
+            slot_completeness=slot_completeness,
+            pending_questions=[],
+            next_action=NextAction(type="NONE", reason="interrupt"),
+            trip_profile=_build_trip_profile(slots),
+        )
 
     # ----- 3) 解析 slots_json，或用 current_slots -----
     slots_from_llm: Optional[TripPlanRequest] = None
@@ -1733,9 +1830,10 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
         and not _detect_refine_intent(req.input_text)
     )
     draft = None
+    draft_reply = None
     if use_dialog:
         ctx = _build_dialog_context(req, slots, intent, region, days_guess)
-        draft = _call_llm_for_dialog_draft(req, system_content, ctx)
+        draft, draft_reply = _call_llm_for_dialog_draft(req, system_content, ctx)
     logger.info(
         "dialog_draft_takeover use_dialog=%s ok=%s trace_id=%s",
         use_dialog,
@@ -1775,6 +1873,64 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
             next_action=NextAction(type="ASK", reason="dialog_draft"),
             trip_profile=_build_trip_profile(slots),
         )
+    if use_dialog and draft is None:
+        reply_preview = (draft_reply or "")[:200]
+        logger.warning(
+            "dialog_draft_failed trace_id=%s reply_preview=%s",
+            trace_id,
+            reply_preview,
+        )
+        actions_slot_key, actions_prompt, actions_quick_replies, slots = _select_actions_question(
+            slots,
+            text_merge,
+            days_guess,
+            history_with_new_user,
+            user_turns,
+        )
+        if actions_prompt:
+            qid = _question_id_for_slot(actions_slot_key)
+            pending_questions = [
+                PendingQuestion(
+                    id=qid,
+                    question_id=qid,
+                    slot_key=actions_slot_key,
+                    prompt=actions_prompt,
+                    status="open",
+                    asked_at=str(int(time.time())),
+                )
+            ]
+            _record_asked_slot(slots, actions_slot_key, qid, user_turns)
+
+            resources_out = resources_from_kb if isinstance(resources_from_kb, dict) else {}
+            if actions_quick_replies:
+                existing = resources_out.setdefault("quick_replies", [])
+                if not isinstance(existing, list):
+                    existing = []
+                    resources_out["quick_replies"] = existing
+                for item in actions_quick_replies:
+                    if item and item not in existing:
+                        existing.append(item)
+                resources_out["quick_replies"] = existing[:12]
+
+            reply_text = actions_prompt
+            new_history = list(history_with_new_user) + [ChatMessage(role="assistant", content=reply_text)]
+            slot_completeness = SlotCompleteness(
+                required_done=_estimate_required_done(slots),
+                required_total=4,
+            )
+            return TripChatResponse(
+                reply=reply_text,
+                history=new_history,
+                slots=slots,
+                trip_plan=None,
+                resources=resources_out,
+                mode="EXPLORE",
+                dialog_state=DialogState.DISCOVERY,
+                slot_completeness=slot_completeness,
+                pending_questions=pending_questions,
+                next_action=NextAction(type="ASK", reason=f"missing_{actions_slot_key}"),
+                trip_profile=_build_trip_profile(slots),
+            )
 
     # ----- 4.2) empty/generic reply fallback -----
     destination_value = slots.destination if slots is not None else None
@@ -1796,7 +1952,7 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
             use_dialog_draft = True
     if use_dialog_draft:
         ctx = _build_dialog_context(req, slots, intent, region, days_guess)
-        draft = _call_llm_for_dialog_draft(req, system_content, ctx)
+        draft, _draft_reply = _call_llm_for_dialog_draft(req, system_content, ctx)
         if draft is not None:
             reply_text = _render_dialog_draft(draft)
             dialog_quick_replies = list(draft.quick_replies or [])
