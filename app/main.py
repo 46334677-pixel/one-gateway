@@ -1,3 +1,4 @@
+import os
 import uuid
 
 from fastapi import FastAPI, Request
@@ -16,6 +17,8 @@ app = FastAPI(
     description="Trip/Compare/Biz aggregation gateway",
 )
 
+BUILD_ID = os.getenv("BUILD_ID", "dev")
+
 
 @app.middleware("http")
 async def add_trace_id(request: Request, call_next):
@@ -25,6 +28,7 @@ async def add_trace_id(request: Request, call_next):
     # expose trace id to clients for troubleshooting
     response.headers["X-Trace-Id"] = trace_id
     response.headers["X-Request-Id"] = trace_id
+    response.headers["X-Build-Id"] = BUILD_ID
     return response
 
 app.include_router(trip_chat_cn.router)

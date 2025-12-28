@@ -1456,6 +1456,38 @@ def _try_parse_json(txt: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _looks_like_spots_json(s: str) -> bool:
+    t = (s or "").strip()
+    if not t.startswith("{"):
+        return False
+    return ('"summary"' in t or "summary" in t) and ('"spots"' in t or "spots" in t)
+
+
+def _render_spots_json_to_user(obj: dict, destination: str) -> str:
+    summary = (obj.get("summary") or "").strip()
+    spots = obj.get("spots") or []
+    if summary == "无法生成" or not isinstance(spots, list) or len(spots) == 0:
+        return (
+            f"我先接住：你现在想玩【{destination}】。\n"
+            "我可以先给你两种方向，你选一个，我再按你家带娃的节奏细化：\n"
+            "A）滑雪 + 温泉（轻松度假）\n"
+            "B）天池 + 雾凇（经典打卡）\n\n"
+            "你更偏 A 还是 B？顺便告诉我：大概几天、几位同行（有几个小朋友）？"
+        )
+
+    lines = [f"先给你一份【{destination}】必玩清单（我再按你的天数去排程）："]
+    for i, it in enumerate(spots[:8], 1):
+        name = (it.get("name") or "").strip()
+        cat = (it.get("category") or "").strip()
+        brief = (it.get("brief_desc") or "").strip()
+        if not name:
+            continue
+        tail = "｜" + cat if cat else ""
+        lines.append(f"{i}. {name}{tail}：{brief}")
+    lines.append("\n你更想偏“滑雪/温泉/天池/亲子轻松”？我按偏好给你 2-3 条路线选项。")
+    return "\n".join(lines)
+
+
 def _is_interrupt(text: str) -> bool:
     t = (text or "").strip()
     if not t:
@@ -1743,6 +1775,9 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
 
     # ---- DialogDraft takeover (V1) ----
     intent = _classify_intent(req.input_text)
+    # ----- 意图修正：在旅行上下文里，纯地名输入也应视为 explore -----
+    if getattr(slots, "destination", None) and len((req.input_text or "").strip()) <= 8:
+        intent = "explore"
     region = _pick_region(text_merge) if _is_region_query(text_merge) else None
     days_guess = _guess_days(text_merge)
     has_user_origin = bool(req.origin) or (
@@ -1912,6 +1947,9 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
     # ----- 4.2) empty/generic reply fallback -----
     destination_value = slots.destination if slots is not None else None
     intent = _classify_intent(req.input_text)
+    # ----- 意图修正：在旅行上下文里，纯地名输入也应视为 explore -----
+    if getattr(slots, "destination", None) and len((req.input_text or "").strip()) <= 8:
+        intent = "explore"
     region = _pick_region(text_merge) if _is_region_query(text_merge) else None
     should_plan = intent == "plan" and not (region and not destination_value)
     days_guess = _guess_days(text_merge)
@@ -1919,6 +1957,33 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
         bool(getattr(slots, "origin", None)) and getattr(slots, "origin", None) != req.default_origin
     )
     missing_required = _evaluate_missing_required(slots, days_guess, has_user_origin)
+    # ----- 强制推进：有目的地但关键槽位缺失时，一定要问问题 -----
+    destination_value = getattr(slots, "destination", None) if slots is not None else None
+    if destination_value and missing_required:
+        followup = _pick_followup_question(slots, history_with_new_user, user_turns, _guess_days(text_merge))
+        if followup:
+            reply_text = followup["prompt"]
+            resources_out = resources_from_kb if isinstance(resources_from_kb, dict) else {}
+            qrs = followup.get("quick_replies") or []
+            if qrs:
+                resources_out["quick_replies"] = qrs[:12]
+
+            new_history = list(history_with_new_user) + [ChatMessage(role="assistant", content=reply_text)]
+            return TripChatResponse(
+                reply=reply_text,
+                history=new_history,
+                slots=slots,
+                trip_plan=None,
+                resources=resources_out,
+                mode="EXPLORE",
+                dialog_state=DialogState.DISCOVERY,
+                slot_completeness=SlotCompleteness(
+                    required_done=_estimate_required_done(slots), required_total=4
+                ),
+                pending_questions=[],
+                next_action=NextAction(type="ASK", reason="force_followup"),
+                trip_profile=_build_trip_profile(slots),
+            )
     refine_intent = _detect_refine_intent(req.input_text)
     dest_key = _normalize_dest_key(destination_value or req.destination, text_merge)
     use_dialog_draft = False
@@ -2239,6 +2304,19 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
     elif origin_conflict_note:
         reply_text = origin_conflict_note + ("\n" + reply_text if reply_text else "")
     mode = _detect_mode(req.input_text, has_trip_plan)
+
+    # ----- 防止内部 spots-json 泄漏到前端 -----
+    if _looks_like_spots_json(reply_text):
+        try:
+            obj = json.loads(reply_text)
+        except Exception:
+            obj = None
+        dest = getattr(slots, "destination", None) if slots is not None else (req.destination or "")
+        if isinstance(obj, dict) and dest:
+            reply_text = _render_spots_json_to_user(obj, dest)
+        else:
+            reply_text = ""
+
     reply_text = _enforce_v1_actions_style(reply_text)
     final_reply = reply_text or "这边现在有点忙，你可以稍后再试试。"
     final_history = history_with_new_user + [ChatMessage(role="assistant", content=final_reply)]
