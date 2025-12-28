@@ -1,7 +1,7 @@
 import json
 import os
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Any
 
 import requests
 from pydantic import BaseModel
@@ -133,16 +133,12 @@ def _build_messages(llm_input: TripChatLLMInput):
     return messages
 
 
-def _is_decision_json(obj) -> bool:
+def _is_trip_chat_decision(obj: Any) -> bool:
     if not isinstance(obj, dict):
         return False
-    decision_keys = {
-        "reply",
-        "should_call_trip_plan",
-        "confirm_real_world",
-        "slots_json",
-    }
-    return any(k in obj for k in decision_keys)
+    return any(
+        k in obj for k in ("reply", "should_call_trip_plan", "confirm_real_world", "slots_json")
+    )
 
 
 def call_qwen_for_trip_chat(llm_input: TripChatLLMInput) -> TripChatLLMDecision:
@@ -188,13 +184,8 @@ def call_qwen_for_trip_chat(llm_input: TripChatLLMInput) -> TripChatLLMDecision:
     # 期望 content 是一个 JSON 字符串
     try:
         obj = json.loads(content)
-        if not _is_decision_json(obj):
-            return TripChatLLMDecision(
-                reply=content,
-                should_call_trip_plan=False,
-                confirm_real_world=False,
-                slots_json=None,
-            )
+        if not _is_trip_chat_decision(obj):
+            raise ValueError("non-decision json")
         reply = obj.get("reply") or ""
         should_call_trip_plan = bool(obj.get("should_call_trip_plan", False))
         confirm_real_world = bool(obj.get("confirm_real_world", False))

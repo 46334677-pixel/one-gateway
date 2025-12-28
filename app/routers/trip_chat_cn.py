@@ -1456,52 +1456,36 @@ def _try_parse_json(txt: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def _detect_interrupt_type(text: str) -> Optional[str]:
-    t = text or ""
-    if re.search(r"(讲个故事|来个故事|编个故事)", t):
-        return "story"
-    if re.search(r"(讲个笑话|来个笑话|逗我开心)", t):
-        return "joke"
-    if re.search(r"(心情不好|难受|焦虑|安慰我|鼓励我)", t):
-        return "comfort"
-    if re.search(r"(先不聊旅行|暂停|等会再说)", t):
-        return "pause"
-    return None
+def _is_interrupt(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return False
+    return bool(
+        re.search(
+            r"(讲个故事|来个故事|睡前故事|讲个笑话|来个笑话|心情不好|难受|焦虑|安慰我|鼓励我|先不聊旅行|暂停一下)",
+            t,
+        )
+    )
 
 
-def _build_interrupt_reply(kind: str) -> str:
-    if kind == "story":
-        return "\n".join(
-            [
-                "好呀，讲个温暖的小故事给你。",
-                "从前有一只小狐狸，走在雪地里迷了路。它沿着自己的脚印慢慢往回走，",
-                "途中遇到一只小鹿，小鹿说：“你看，雪地里每一步都算数。”",
-                "小狐狸一下就不慌了，原来每一次尝试都会留下方向。",
-                "你想听轻松一点的，还是更治愈一点的？",
-            ]
+def _render_interrupt_reply(text: str) -> str:
+    t = (text or "").strip()
+    if re.search(r"(笑话|逗我开心)", t):
+        return (
+            "给你来个短的：\n有个人去买伞，老板问：要大的还是小的？\n他说：要能遮住我最近的坏心情的。\n"
+            "老板想了想：那得买把‘想开点’。\n\n"
+            "如果你愿意，跟我说一句你今天最烦的事，我帮你把它拆小一点。"
         )
-    if kind == "joke":
-        return "\n".join(
-            [
-                "来个轻松的：",
-                "我朋友问我：旅行最怕什么？",
-                "我说：最怕行李箱打开的一瞬间，发现带了三件外套，却忘了充电器。",
-                "别急，我再给你讲一个更好笑的？",
-            ]
+    if re.search(r"(心情不好|难受|焦虑|安慰|鼓励)", t):
+        return (
+            "我听到了：你现在有点扛不住，但你并没有放弃把事情变好。\n\n"
+            "先做一个很小的动作：喝口水、把肩膀放松、深呼吸三次。\n"
+            "然后告诉我：你更像是“累”还是“烦”还是“委屈”？我按这个给你一个更贴合的缓解方案。"
         )
-    if kind == "comfort":
-        return "\n".join(
-            [
-                "听起来你现在不太好受，我在这儿陪你。",
-                "先做个小练习：慢慢吸气 4 秒，屏住 2 秒，再呼气 6 秒，重复 3 轮。",
-                "如果你愿意，也可以简单说说是什么让你难受，我会认真听。",
-            ]
-        )
-    return "\n".join(
-        [
-            "好的，我们先暂停旅行话题。",
-            "你想聊点别的，还是先安静一会儿？",
-        ]
+    return (
+        "给你讲个很短的故事：\n有个旅人背着一袋石头走路，越走越累。路边的老人问：你为什么不放下一块？\n"
+        "旅人说：我怕少了一块就不完整。\n老人笑了：完整不是把所有都背着，而是知道什么时候该放下。\n\n"
+        "你也一样。先把最重的那一块告诉我是哪一块。"
     )
 
 
@@ -1592,6 +1576,41 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
         req.user_lng,
     )
 
+    # ----- 0) 中断优先：讲故事/笑话/情绪安抚，先接住再说 -----
+    if _is_interrupt(req.input_text):
+        reply_text = _render_interrupt_reply(req.input_text)
+
+        history_with_new_user = list(req.history or [])
+        if not history_with_new_user:
+            history_with_new_user = [ChatMessage(role="user", content=req.input_text)]
+        else:
+            last = history_with_new_user[-1]
+            if not (
+                last.role == "user"
+                and (last.content or "").strip() == (req.input_text or "").strip()
+            ):
+                history_with_new_user.append(ChatMessage(role="user", content=req.input_text))
+
+        new_history = list(history_with_new_user) + [
+            ChatMessage(role="assistant", content=reply_text)
+        ]
+
+        resources_out = {
+            "quick_replies": ["继续规划", "我想看路线选项", "换个目的地", "改预算档位", "改出行日期"]
+        }
+
+        return TripChatResponse(
+            reply=reply_text,
+            history=new_history,
+            slots=None,
+            trip_plan=None,
+            resources=resources_out,
+            mode="CHAT",
+            dialog_state=DialogState.PAUSED,
+            pending_questions=[],
+            next_action=NextAction(reason="interrupt"),
+        )
+
     # ----- 1) 知识库：不再早退，只先记录 resources -----
     kb_res = kb.kb_search(kb.KbSearch(query=req.input_text, destination=""))
     kb_items = kb_res.get("items") if kb_res else []
@@ -1616,48 +1635,6 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
             history_with_new_user.append(ChatMessage(role="user", content=req.input_text))
     user_turns = _count_user_turns(history_with_new_user)
     _ = user_turns  # 保留变量以避免未来逻辑改动时被误删
-
-    # ----- 2.5) 中断/闲聊优先：先接话题，再决定是否继续规划 -----
-    interrupt_type = _detect_interrupt_type(req.input_text)
-    if interrupt_type:
-        reply_text = _build_interrupt_reply(interrupt_type)
-        resources_out = resources_from_kb if isinstance(resources_from_kb, dict) else {}
-        interrupt_replies = [
-            "继续规划",
-            "换个目的地",
-            "改预算档位",
-            "我想看路线选项",
-            "先聊聊天",
-            "稍后再说",
-        ]
-        existing = resources_out.setdefault("quick_replies", [])
-        if not isinstance(existing, list):
-            existing = []
-            resources_out["quick_replies"] = existing
-        for item in interrupt_replies:
-            if item not in existing:
-                existing.append(item)
-        resources_out["quick_replies"] = existing[:12]
-
-        slots = req.current_slots
-        slot_completeness = SlotCompleteness(
-            required_done=_estimate_required_done(slots),
-            required_total=4,
-        )
-        final_history = list(history_with_new_user) + [ChatMessage(role="assistant", content=reply_text)]
-        return TripChatResponse(
-            reply=reply_text,
-            history=final_history,
-            slots=slots,
-            trip_plan=None,
-            resources=resources_out,
-            mode="EXPLORE",
-            dialog_state=DialogState.PAUSED,
-            slot_completeness=slot_completeness,
-            pending_questions=[],
-            next_action=NextAction(type="NONE", reason="interrupt"),
-            trip_profile=_build_trip_profile(slots),
-        )
 
     # ----- 3) 解析 slots_json，或用 current_slots -----
     slots_from_llm: Optional[TripPlanRequest] = None
