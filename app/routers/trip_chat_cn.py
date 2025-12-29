@@ -420,6 +420,26 @@ def _render_actions_starter(
     return reply_text, quick_replies
 
 
+def _render_discovery_7qs(origin_hint: Optional[str], region_hint: Optional[str]) -> str:
+    origin_show = origin_hint or "（你也可以直接告诉我从哪里出发）"
+    region_show = region_hint or "这趟行程"
+    return "\n".join(
+        [
+            f"好呀，{region_show}我可以帮你做成一份“好抄作业”的自由行行程。",
+            "我先用 7 个关键点把需求对齐（你只回 1–2 条也行，其余我先按常见值默认）：",
+            f"1. 出发地：我这边看到你可能从「{origin_show}」出发（可改：北京/上海/广州等）",
+            "2. 出行时间：元旦 / 寒假 / 周末 / 自定日期 / 我不确定",
+            "3. 天数：2天 / 3天 / 4-5天 / 6-7天 / 我不确定",
+            "4. 同行人：1人 / 情侣夫妻 / 2大1小 / 3大2小 / 带老人 / 我不确定",
+            "5. 预算：经济 / 中等 / 舒适 / 高端（或直接说总预算）",
+            "6. 玩法偏好：滑雪 / 温泉 / 冰雪 / 美食 / 人文 / 亲子 / 混合",
+            "7. 约束/在意点：怕冷少走路 / 需要午睡&推车 / 想住温泉酒店 / 想轻松不赶路",
+            "你也可以直接回一句整合信息，例如：",
+            "“香港出发，元旦，4-5天，3大2小，中等预算，想滑雪+温泉，节奏休闲”",
+        ]
+    )
+
+
 def _render_region_starter_card(region_value: str, origin_hint: Optional[str]) -> Tuple[str, List[str]]:
     region_text = region_value or "目的地"
     origin_text = f"从{origin_hint}出发" if origin_hint else "出发地未定"
@@ -1089,27 +1109,25 @@ def _needs_recommendations(text: str) -> bool:
 
 
 def _enforce_v1_actions_style(reply_text: str) -> str:
-    text = reply_text or ""
-    if not text.strip():
+    text = (reply_text or "").strip()
+    if not text:
         return text
 
-    lines = text.splitlines()
-    numbered = [idx for idx, line in enumerate(lines) if re.search(r"^\s*\d+[.、)]", line)]
+    lines = [ln.rstrip() for ln in text.splitlines()]
+    numbered = [ln for ln in lines if re.match(r"^\s*\d+[.、)]\s*", ln)]
 
-    if len(numbered) >= 4:
-        keep_questions = set(numbered[:3])
-        trimmed_lines = []
-        for idx, line in enumerate(lines):
-            if idx in keep_questions or idx not in numbered:
-                trimmed_lines.append(line)
-        prefix = "我先给你两个方向，你选完我再细化。"
-        return "\n".join([prefix] + [ln for ln in trimmed_lines if ln.strip()])
-
-    if re.search(r"(范围太大|范围较大|具体城市|请补充|补充.*(日期|人数|目的地))", text):
-        non_empty = [ln for ln in lines if ln.strip()]
-        if len(non_empty) <= 2 and not re.search(r"(Options|方案|线路|路线|卡)", text):
-            fallback_text, _ = _render_actions_starter("GENERIC", None, None, None, text="")
-            return fallback_text
+    # v2: allow up to 7 numbered questions; only trim if too many.
+    if len(numbered) >= 8:
+        kept = []
+        count = 0
+        for ln in lines:
+            if re.match(r"^\s*\d+[.、)]\s*", ln):
+                count += 1
+                if count <= 7:
+                    kept.append(ln)
+                continue
+            kept.append(ln)
+        return "\n".join(kept).strip()
 
     return text
 
@@ -1254,7 +1272,8 @@ def _select_actions_question(
         if not _should_ask(slot_key, slots, history, current_turn, days_guess):
             continue
         if slot_key == "destination_city":
-            prompt = f"{region_value}范围比较大，你更想去哪个城市？点下面就行。"
+            origin_hint = getattr(slots, "origin", None) if slots is not None else None
+            prompt = _render_discovery_7qs(origin_hint=origin_hint, region_hint=region_value)
             quick_replies = _region_city_candidates(region_value)
             quick_replies = (quick_replies or []) + ["我还不确定"]
             return slot_key, prompt, quick_replies, slots
