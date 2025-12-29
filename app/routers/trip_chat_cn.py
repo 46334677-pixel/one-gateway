@@ -665,6 +665,35 @@ def _record_asked_slot(slots: Optional[TripPlanRequest], slot_key: str, qid: str
     setattr(slots, "meta", meta)
 
 
+def _ensure_meta(slots: TripPlanRequest) -> Dict[str, Any]:
+    if slots.meta is None:
+        slots.meta = {}
+    return slots.meta
+
+
+def _mark_declined(slots: TripPlanRequest, slot_key: str, reason: str = "user_declined") -> None:
+    meta = _ensure_meta(slots)
+    declined = meta.get("declined_slots") or {}
+    declined[slot_key] = {"reason": reason, "at": int(time.time())}
+    meta["declined_slots"] = declined
+
+
+def _last_asked_slot(slots: TripPlanRequest) -> Optional[str]:
+    meta = _ensure_meta(slots)
+    asked = meta.get("asked_slots") or []
+    if not asked:
+        return None
+    last = asked[-1] if isinstance(asked, list) else None
+    return last.get("slot_key") if isinstance(last, dict) else None
+
+
+def _is_refusal(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return False
+    return bool(re.search(r"(不告诉你|不想说|不方便说|不说|不想聊|先不说|不回答)", t))
+
+
 def _slot_filled(slot_key: str, slots: Optional[TripPlanRequest], days_guess: Optional[int]) -> bool:
     if slots is None:
         return False
@@ -699,6 +728,12 @@ def _should_ask(
 ) -> bool:
     if _slot_filled(slot_key, slots, days_guess):
         return False
+    if slots is not None:
+        meta = getattr(slots, "meta", None)
+        if isinstance(meta, dict):
+            declined = meta.get("declined_slots") or {}
+            if declined.get(slot_key):
+                return False
     for it in _get_asked_slots(slots):
         if it.get("slot_key") == slot_key and current_turn - int(it.get("turn", 0)) <= max_turns:
             return False
@@ -1156,6 +1191,11 @@ def _select_actions_question(
     history: List[ChatMessage],
     current_turn: int,
 ) -> Tuple[Optional[str], Optional[str], List[str], Optional[TripPlanRequest]]:
+    declined = {}
+    if slots is not None:
+        meta = getattr(slots, "meta", None)
+        if isinstance(meta, dict):
+            declined = meta.get("declined_slots") or {}
     destination_value = getattr(slots, "destination", None) if slots is not None else None
     region_value = destination_value if _is_region_destination_value(destination_value) else None
 
@@ -1185,6 +1225,8 @@ def _select_actions_question(
 
     for slot_key, needed in candidates:
         if not needed:
+            continue
+        if declined.get(slot_key):
             continue
         if not _should_ask(slot_key, slots, history, current_turn, days_guess):
             continue
@@ -1248,11 +1290,18 @@ def _pick_followup_question(
     current_turn: int,
     days_guess: Optional[int],
 ) -> Optional[Dict[str, str]]:
+    declined = {}
+    if slots is not None:
+        meta = getattr(slots, "meta", None)
+        if isinstance(meta, dict):
+            declined = meta.get("declined_slots") or {}
     candidates = [
         ("style", "你更偏户外运动还是休闲度假？"),
         ("budget_level", "预算大概什么档位（经济/舒适/高端）？"),
     ]
     for key, prompt in candidates:
+        if declined.get(key):
+            continue
         if _should_ask(key, slots, history, current_turn, days_guess):
             return {"slot_key": key, "prompt": prompt}
     return None
@@ -1648,10 +1697,13 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
     kb_items = kb_res.get("items") if kb_res else []
     resources_from_kb = _kb_to_resources(kb_items) if kb_items else None
 
-    # ----- 2) 调 LLM（强约束 JSON，失败重试一次），保留原始回复 -----
-    reply_text, parsed_json, decision_used = _call_llm_for_json(req, system_content)
-    reply_text = reply_text or ""
-    _ = parsed_json  # 保留变量，避免未来扩展时误删
+    # ----- 2) 调 LLM（强约束 JSON，仅推荐场景使用） -----
+    reply_text = ""
+    parsed_json = None
+    decision_used = None
+
+    if _needs_recommendations(req.input_text):
+        _raw_json_reply, parsed_json, decision_used = _call_llm_for_json(req, system_content)
 
     # 只把“本轮用户消息”先加进 history，用于统计 user_turns
     history_with_new_user = list(req.history)
@@ -1772,6 +1824,10 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
     # ----- 4.15) 解析用户显式槽位并合并 -----
     slots = _merge_slots(slots, _parse_user_slots(req.input_text))
     slots = _infer_profile_from_slots(slots)
+    if slots is not None and _is_refusal(req.input_text):
+        last = _last_asked_slot(slots)
+        if last:
+            _mark_declined(slots, last)
 
     # ---- DialogDraft takeover (V1) ----
     intent = _classify_intent(req.input_text)
@@ -1785,6 +1841,7 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
     )
     missing_required = _evaluate_missing_required(slots, days_guess, has_user_origin)
     actions_intent = (intent in {"plan", "explore"} or _needs_recommendations(req.input_text))
+    suggested_quick_replies: List[str] = []
     actions_slot_key, actions_prompt, actions_quick_replies, slots = _select_actions_question(
         slots,
         text_merge,
@@ -1793,49 +1850,7 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
         user_turns,
     )
     if actions_intent and actions_prompt and not _detect_refine_intent(req.input_text):
-        qid = _question_id_for_slot(actions_slot_key)
-        pending_questions = [
-            PendingQuestion(
-                id=qid,
-                question_id=qid,
-                slot_key=actions_slot_key,
-                prompt=actions_prompt,
-                status="open",
-                asked_at=str(int(time.time())),
-            )
-        ]
-        _record_asked_slot(slots, actions_slot_key, qid, user_turns)
-
-        resources_out = resources_from_kb if isinstance(resources_from_kb, dict) else {}
-        if actions_quick_replies:
-            existing = resources_out.setdefault("quick_replies", [])
-            if not isinstance(existing, list):
-                existing = []
-                resources_out["quick_replies"] = existing
-            for item in actions_quick_replies:
-                if item and item not in existing:
-                    existing.append(item)
-            resources_out["quick_replies"] = existing[:12]
-
-        reply_text = actions_prompt
-        new_history = list(history_with_new_user) + [ChatMessage(role="assistant", content=reply_text)]
-        slot_completeness = SlotCompleteness(
-            required_done=_estimate_required_done(slots),
-            required_total=4,
-        )
-        return TripChatResponse(
-            reply=reply_text,
-            history=new_history,
-            slots=slots,
-            trip_plan=None,
-            resources=resources_out,
-            mode="EXPLORE",
-            dialog_state=DialogState.DISCOVERY,
-            slot_completeness=slot_completeness,
-            pending_questions=pending_questions,
-            next_action=NextAction(type="ASK", reason=f"missing_{actions_slot_key}"),
-            trip_profile=_build_trip_profile(slots),
-        )
+        suggested_quick_replies = actions_quick_replies or []
     use_dialog = (
         (intent in {"plan", "explore"} or _needs_recommendations(req.input_text))
         and (missing_required or region)
@@ -1900,49 +1915,7 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
             user_turns,
         )
         if actions_prompt:
-            qid = _question_id_for_slot(actions_slot_key)
-            pending_questions = [
-                PendingQuestion(
-                    id=qid,
-                    question_id=qid,
-                    slot_key=actions_slot_key,
-                    prompt=actions_prompt,
-                    status="open",
-                    asked_at=str(int(time.time())),
-                )
-            ]
-            _record_asked_slot(slots, actions_slot_key, qid, user_turns)
-
-            resources_out = resources_from_kb if isinstance(resources_from_kb, dict) else {}
-            if actions_quick_replies:
-                existing = resources_out.setdefault("quick_replies", [])
-                if not isinstance(existing, list):
-                    existing = []
-                    resources_out["quick_replies"] = existing
-                for item in actions_quick_replies:
-                    if item and item not in existing:
-                        existing.append(item)
-                resources_out["quick_replies"] = existing[:12]
-
-            reply_text = actions_prompt
-            new_history = list(history_with_new_user) + [ChatMessage(role="assistant", content=reply_text)]
-            slot_completeness = SlotCompleteness(
-                required_done=_estimate_required_done(slots),
-                required_total=4,
-            )
-            return TripChatResponse(
-                reply=reply_text,
-                history=new_history,
-                slots=slots,
-                trip_plan=None,
-                resources=resources_out,
-                mode="EXPLORE",
-                dialog_state=DialogState.DISCOVERY,
-                slot_completeness=slot_completeness,
-                pending_questions=pending_questions,
-                next_action=NextAction(type="ASK", reason=f"missing_{actions_slot_key}"),
-                trip_profile=_build_trip_profile(slots),
-            )
+            suggested_quick_replies = actions_quick_replies or []
 
     # ----- 4.2) empty/generic reply fallback -----
     destination_value = slots.destination if slots is not None else None
@@ -2194,6 +2167,14 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
             existing = []
             resources_out["quick_replies"] = existing
         for item in quick_replies:
+            if item not in existing:
+                existing.append(item)
+    if suggested_quick_replies:
+        existing = resources_out.setdefault("quick_replies", [])
+        if not isinstance(existing, list):
+            existing = []
+            resources_out["quick_replies"] = existing
+        for item in suggested_quick_replies:
             if item not in existing:
                 existing.append(item)
     if actions_quick_replies:
