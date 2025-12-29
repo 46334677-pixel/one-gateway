@@ -420,6 +420,20 @@ def _render_actions_starter(
     return reply_text, quick_replies
 
 
+def _render_region_starter_card(region_value: str, origin_hint: Optional[str]) -> Tuple[str, List[str]]:
+    region_text = region_value or "目的地"
+    origin_text = f"从{origin_hint}出发" if origin_hint else "出发地未定"
+    lines = [
+        f"{region_text}范围较大，我先给你一个首轮选择卡（{origin_text}）：",
+        "【A】经典打卡线：城市地标 + 代表景点，节奏适中",
+        "【B】轻松度假线：酒店/温泉/慢游，节奏轻松",
+        "【C】主题玩法线：按季节与兴趣选（如滑雪/美食/亲子）",
+        "你更偏 A/B/C？也可以直接告诉我大概几天、几位同行。",
+    ]
+    quick_replies = ["选A", "选B", "选C", "我不确定", "元旦", "寒假", "未定"]
+    return "\n".join(lines), quick_replies
+
+
 def _guess_days(text: str) -> Optional[int]:
     m = re.search(r"(\d+)\s*(?:天|日)", text or "")
     if m:
@@ -691,7 +705,12 @@ def _is_refusal(text: str) -> bool:
     t = (text or "").strip()
     if not t:
         return False
-    return bool(re.search(r"(不告诉你|不想说|不方便说|不说|不想聊|先不说|不回答)", t))
+    return bool(
+        re.search(
+            r"(不告诉你|不想说|不方便说|不说|不想聊|先不说|不回答|不了|随便|你猜)",
+            t,
+        )
+    )
 
 
 def _slot_filled(slot_key: str, slots: Optional[TripPlanRequest], days_guess: Optional[int]) -> bool:
@@ -1192,10 +1211,12 @@ def _select_actions_question(
     current_turn: int,
 ) -> Tuple[Optional[str], Optional[str], List[str], Optional[TripPlanRequest]]:
     declined = {}
+    starter_card_shown = False
     if slots is not None:
         meta = getattr(slots, "meta", None)
         if isinstance(meta, dict):
             declined = meta.get("declined_slots") or {}
+            starter_card_shown = bool(meta.get("starter_card_shown"))
     destination_value = getattr(slots, "destination", None) if slots is not None else None
     region_value = destination_value if _is_region_destination_value(destination_value) else None
 
@@ -1227,6 +1248,8 @@ def _select_actions_question(
         if not needed:
             continue
         if declined.get(slot_key):
+            continue
+        if slot_key == "destination_city" and starter_card_shown:
             continue
         if not _should_ask(slot_key, slots, history, current_turn, days_guess):
             continue
@@ -1828,6 +1851,39 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
         last = _last_asked_slot(slots)
         if last:
             _mark_declined(slots, last)
+        if last in {"destination_city", "traveler_count", "budget_level", "preferences"}:
+            dest_key = _normalize_dest_key(getattr(slots, "destination", None) or req.destination, text_merge)
+            region_value = _pick_region(text_merge) if _is_region_query(text_merge) else None
+            archetype = _route_archetype(dest_key, text_merge, region_value)
+            reply_text, actions_quick_replies = _render_actions_starter(
+                archetype,
+                dest_key,
+                _guess_days(text_merge),
+                origin_value or req.default_origin or req.origin,
+                text=req.input_text,
+            )
+            reply_text = (reply_text or "") + "\n\n你只要回 1 条即可。"
+            resources_out = resources_from_kb if isinstance(resources_from_kb, dict) else {}
+            if actions_quick_replies:
+                resources_out["quick_replies"] = actions_quick_replies[:12]
+            new_history = list(history_with_new_user) + [ChatMessage(role="assistant", content=reply_text)]
+            slot_completeness = SlotCompleteness(
+                required_done=_estimate_required_done(slots),
+                required_total=4,
+            )
+            return TripChatResponse(
+                reply=reply_text,
+                history=new_history,
+                slots=slots,
+                trip_plan=None,
+                resources=resources_out,
+                mode="EXPLORE",
+                dialog_state=DialogState.DISCOVERY,
+                slot_completeness=slot_completeness,
+                pending_questions=[],
+                next_action=NextAction(type="NONE", reason="user_declined"),
+                trip_profile=_build_trip_profile(slots),
+            )
 
     # ---- DialogDraft takeover (V1) ----
     intent = _classify_intent(req.input_text)
@@ -1841,6 +1897,45 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
     )
     missing_required = _evaluate_missing_required(slots, days_guess, has_user_origin)
     actions_intent = (intent in {"plan", "explore"} or _needs_recommendations(req.input_text))
+    region_value = None
+    if slots is not None and _is_region_destination_value(getattr(slots, "destination", None)):
+        region_value = slots.destination
+    if not region_value:
+        region_hit = _extract_region_from_text(text_merge)
+        if region_hit:
+            region_value = region_hit
+            if slots is None:
+                slots = TripPlanRequest()
+            slots.destination = region_hit
+    if region_value and user_turns <= 2:
+        meta = _ensure_meta(slots)
+        if not meta.get("starter_card_shown"):
+            meta["starter_card_shown"] = True
+            reply_text, starter_quick_replies = _render_region_starter_card(
+                region_value,
+                origin_value or req.default_origin or req.origin,
+            )
+            resources_out = resources_from_kb if isinstance(resources_from_kb, dict) else {}
+            if starter_quick_replies:
+                resources_out["quick_replies"] = starter_quick_replies[:12]
+            new_history = list(history_with_new_user) + [ChatMessage(role="assistant", content=reply_text)]
+            slot_completeness = SlotCompleteness(
+                required_done=_estimate_required_done(slots),
+                required_total=4,
+            )
+            return TripChatResponse(
+                reply=reply_text,
+                history=new_history,
+                slots=slots,
+                trip_plan=None,
+                resources=resources_out,
+                mode="EXPLORE",
+                dialog_state=DialogState.DISCOVERY,
+                slot_completeness=slot_completeness,
+                pending_questions=[],
+                next_action=NextAction(type="ASK", reason="starter_card"),
+                trip_profile=_build_trip_profile(slots),
+            )
     suggested_quick_replies: List[str] = []
     actions_slot_key, actions_prompt, actions_quick_replies, slots = _select_actions_question(
         slots,
