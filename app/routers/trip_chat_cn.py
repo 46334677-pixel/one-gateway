@@ -526,6 +526,31 @@ def _parse_user_slots(text: str) -> Dict[str, Any]:
     if re.search(r"(舒适|舒服点|品质点|别太省|不要太省)", t):
         result["budget_level"] = "舒适"
 
+    m_family = re.search(r"(\d+)\s*大\s*(\d+)\s*(?:小|娃|儿童)?", t)
+    if m_family:
+        try:
+            adults = int(m_family.group(1))
+            children = int(m_family.group(2))
+            if adults > 0 or children > 0:
+                result["adults"] = adults
+                result["children"] = children
+                result["people_count"] = adults + children
+        except Exception:
+            pass
+
+    if "people_count" not in result:
+        m_adult_child = re.search(r"(\d+)\s*(?:成人|大)\s*(\d+)\s*(?:小|娃|儿童)", t)
+        if m_adult_child:
+            try:
+                adults = int(m_adult_child.group(1))
+                children = int(m_adult_child.group(2))
+                if adults > 0 or children > 0:
+                    result["adults"] = adults
+                    result["children"] = children
+                    result["people_count"] = adults + children
+            except Exception:
+                pass
+
     m = re.search(r"(\d+)\s*(?:人|位|个)", t)
     if m:
         try:
@@ -558,12 +583,21 @@ def _parse_user_slots(text: str) -> Dict[str, Any]:
     if tags:
         result["interest_tags"] = tags
 
-    if re.search(r"(选A|A线|走A)", t, re.IGNORECASE):
+    m_route = re.search(
+        r"(?:路线|线路)?\s*[\(（]?\s*([A-D])\s*[\)）]?\s*(?:线|路线|线路)?",
+        t,
+        re.IGNORECASE,
+    )
+    if m_route:
+        result["route_choice"] = m_route.group(1).upper()
+    elif re.search(r"(选A|A线|走A)", t, re.IGNORECASE):
         result["route_choice"] = "A"
     elif re.search(r"(选B|B线|走B)", t, re.IGNORECASE):
         result["route_choice"] = "B"
     elif re.search(r"(选C|C线|走C)", t, re.IGNORECASE):
         result["route_choice"] = "C"
+    elif re.search(r"(选D|D线|走D)", t, re.IGNORECASE):
+        result["route_choice"] = "D"
     elif re.search(r"(混合|都想要|A和B)", t, re.IGNORECASE):
         result["route_choice"] = "MIX"
 
@@ -596,12 +630,34 @@ def _merge_slots(prev_slots: Optional[TripPlanRequest], new_slots: Dict[str, Any
             _mark_source("budget_level", budget_level)
         slots.budget_level = budget_level
 
+    adults = new_slots.get("adults")
+    children = new_slots.get("children")
+    people_count = new_slots.get("people_count")
     traveler_count = new_slots.get("traveler_count")
-    if traveler_count:
+
+    if adults is not None:
+        old_value = getattr(slots, "adults", None)
+        if old_value != adults:
+            _mark_source("adults", adults)
+        slots.adults = adults
+    if children is not None:
+        old_value = getattr(slots, "children", None)
+        if old_value != children:
+            _mark_source("children", children)
+        slots.children = children
+
+    if people_count is not None:
         old_value = getattr(slots, "people_count", None)
-        if old_value != traveler_count:
-            _mark_source("traveler_count", traveler_count)
-        slots.people_count = traveler_count
+        if old_value is None:
+            _mark_source("people_count", people_count)
+            slots.people_count = people_count
+    elif traveler_count:
+        has_detail = getattr(slots, "adults", None) is not None or getattr(slots, "children", None) is not None
+        if not has_detail:
+            old_value = getattr(slots, "people_count", None)
+            if old_value != traveler_count:
+                _mark_source("traveler_count", traveler_count)
+            slots.people_count = traveler_count
 
     interest_tags = new_slots.get("interest_tags") or []
     if interest_tags:
@@ -624,6 +680,67 @@ def _merge_slots(prev_slots: Optional[TripPlanRequest], new_slots: Dict[str, Any
     meta["slot_sources"] = slot_sources
     setattr(slots, "meta", meta)
     return slots
+
+
+def _rebuild_slots_from_history(
+    origin: Optional[str],
+    destination: Optional[str],
+    history_with_new_user: List[ChatMessage],
+    days_guess: Optional[int],
+) -> TripPlanRequest:
+    slots = TripPlanRequest()
+    if destination:
+        slots.destination = destination
+        meta = getattr(slots, "meta", None)
+        if not isinstance(meta, dict):
+            meta = {}
+        meta["destination_source"] = "client"
+        setattr(slots, "meta", meta)
+    if origin:
+        _set_origin_with_source(slots, origin, "location")
+
+    user_msgs = [m for m in history_with_new_user if m and m.role == "user"]
+    for msg in user_msgs[-12:]:
+        parsed = _parse_user_slots(msg.content or "")
+        slots = _merge_slots(slots, parsed)
+
+    return slots
+
+
+def _merge_slots_from_existing(base: TripPlanRequest, incoming: Optional[TripPlanRequest]) -> TripPlanRequest:
+    if incoming is None:
+        return base
+    if not getattr(base, "destination", None) and getattr(incoming, "destination", None):
+        base.destination = incoming.destination
+    if not getattr(base, "origin", None) and getattr(incoming, "origin", None):
+        _set_origin_with_source(base, incoming.origin, "client")
+    if not _valid_date_range(getattr(base, "date_range", None)) and _valid_date_range(
+        getattr(incoming, "date_range", None)
+    ):
+        base.date_range = incoming.date_range
+    if getattr(base, "adults", None) is None and getattr(incoming, "adults", None) is not None:
+        base.adults = incoming.adults
+    if getattr(base, "children", None) is None and getattr(incoming, "children", None) is not None:
+        base.children = incoming.children
+    if getattr(base, "people_count", None) is None and getattr(incoming, "people_count", None) is not None:
+        base.people_count = incoming.people_count
+    if getattr(base, "budget_level", None) is None and getattr(incoming, "budget_level", None) is not None:
+        base.budget_level = incoming.budget_level
+    if not getattr(base, "preferences", None) and getattr(incoming, "preferences", None):
+        base.preferences = incoming.preferences
+    if getattr(base, "pace_level", None) is None and getattr(incoming, "pace_level", None) is not None:
+        base.pace_level = incoming.pace_level
+    if getattr(base, "style", None) is None and getattr(incoming, "style", None) is not None:
+        base.style = incoming.style
+    incoming_meta = getattr(incoming, "meta", None)
+    if isinstance(incoming_meta, dict):
+        base_meta = getattr(base, "meta", None)
+        if not isinstance(base_meta, dict):
+            base_meta = {}
+        if incoming_meta.get("route_choice") and not base_meta.get("route_choice"):
+            base_meta["route_choice"] = incoming_meta["route_choice"]
+        setattr(base, "meta", base_meta)
+    return base
 
 
 def _estimate_required_done(slots: Optional[TripPlanRequest]) -> int:
@@ -1469,25 +1586,68 @@ def _call_llm_for_dialog_draft(
     return None, reply2 or reply1
 
 
-def _render_dialog_draft(draft: DialogDraft) -> str:
+def _render_dialog_draft(draft: DialogDraft, slots: TripPlanRequest) -> str:
     lines: List[str] = []
-    lines.append("【路线选项】")
-    lines.append(draft.hook)
-    lines.append(draft.confirm)
-    lines.append("我先给你几个方向，你选完我再细化：")
-    for card in draft.options:
-        lines.append(f"【{card.key}】{card.title}")
-        lines.append(f"适合：{card.fit_for}")
-        lines.append("亮点：" + " / ".join(card.highlights))
-        lines.append("节奏：" + " / ".join(card.pace))
-        if card.pitfalls:
-            lines.append("避坑：" + " / ".join(card.pitfalls))
-    lines.append(f"推荐：我更建议选【{draft.recommend_key}】：{draft.recommend_reason}")
+    meta = getattr(slots, "meta", None)
+    route_choice = meta.get("route_choice") if isinstance(meta, dict) else None
+
+    def _should_keep_question(qkey: str) -> bool:
+        if qkey in {"days_or_date_range", "date_range"}:
+            return not _valid_date_range(getattr(slots, "date_range", None))
+        if qkey in {"traveler_count", "people_count"}:
+            return getattr(slots, "people_count", None) is None and getattr(slots, "adults", None) is None
+        if qkey == "budget_level":
+            return not getattr(slots, "budget_level", None)
+        if qkey in {"pace_level", "pace"}:
+            return not getattr(slots, "pace_level", None)
+        return True
+
+    if route_choice and draft.options:
+        picked = None
+        for card in draft.options:
+            if str(card.key or "").upper() == str(route_choice or "").upper():
+                picked = card
+                break
+        if picked:
+            lines.append(f"你选了【{picked.key}】{picked.title}，我会按这个路线为你细化。")
+            lines.append(f"适合：{picked.fit_for}")
+            lines.append("亮点：" + " / ".join(picked.highlights))
+            lines.append("节奏：" + " / ".join(picked.pace))
+            if picked.pitfalls:
+                lines.append("避坑：" + " / ".join(picked.pitfalls))
+    else:
+        lines.append("【路线选项】")
+        lines.append(draft.hook)
+        lines.append(draft.confirm)
+        lines.append("我先给你几个方向，你选完我再细化：")
+        for card in draft.options:
+            lines.append(f"【{card.key}】{card.title}")
+            lines.append(f"适合：{card.fit_for}")
+            lines.append("亮点：" + " / ".join(card.highlights))
+            lines.append("节奏：" + " / ".join(card.pace))
+            if card.pitfalls:
+                lines.append("避坑：" + " / ".join(card.pitfalls))
+        lines.append(f"推荐：我更建议选【{draft.recommend_key}】：{draft.recommend_reason}")
+        lines.extend(
+            [
+                "我先用 7 个关键点把需求对齐（你只回 1–2 条也行，其余我先按常见值默认）：",
+                "1. 出发地：你可以直接告诉我从哪里出发",
+                "2. 出行时间：元旦 / 寒假 / 周末 / 自定日期 / 我不确定",
+                "3. 天数：2天 / 3天 / 4-5天 / 6-7天 / 我不确定",
+                "4. 同行人：1人 / 情侣夫妻 / 2大1小 / 3大2小 / 带老人 / 我不确定",
+                "5. 预算：经济 / 中等 / 舒适 / 高端（或直接说总预算）",
+                "6. 玩法偏好：滑雪 / 温泉 / 冰雪 / 美食 / 人文 / 亲子 / 混合",
+                "7. 约束/在意点：怕冷少走路 / 需要午睡&推车 / 想住温泉酒店 / 想轻松不赶路",
+            ]
+        )
+
     if draft.questions:
-        lines.append("再确认 2-3 个小问题，我就能给你出 5 日草稿：")
-        for idx, q in enumerate(draft.questions, 1):
-            opts = " / ".join(q.options)
-            lines.append(f"{idx}) {q.prompt}（{opts}）")
+        remaining = [q for q in draft.questions if _should_keep_question(q.key)]
+        if remaining:
+            lines.append("再确认 1-2 个小问题，我就能给你出草稿：")
+            for idx, q in enumerate(remaining[:3], 1):
+                opts = " / ".join(q.options)
+                lines.append(f"{idx}) {q.prompt}（{opts}）")
     lines.append(draft.next_step)
     return "\n".join([ln for ln in lines if (ln or "").strip()])
 
@@ -1762,6 +1922,11 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
     user_turns = _count_user_turns(history_with_new_user)
     _ = user_turns  # 保留变量以避免未来逻辑改动时被误删
 
+    text_merge = req.input_text + "\n" + "\n".join(
+        [m.content for m in history_with_new_user if m.role == "user"]
+    )
+    days_guess = _guess_days(text_merge)
+
     # ----- 3) 解析 slots_json，或用 current_slots -----
     slots_from_llm: Optional[TripPlanRequest] = None
     try:
@@ -1781,11 +1946,14 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
         logger.exception("TripChat: failed to parse slots_json")
         slots_from_llm = None
 
-    slots: Optional[TripPlanRequest] = slots_from_llm or req.current_slots
-    if slots is None and req.slots is not None:
+    slots = _rebuild_slots_from_history(
+        req.origin, req.destination, history_with_new_user, days_guess
+    )
+    slots = _merge_slots_from_existing(slots, slots_from_llm)
+    slots = _merge_slots_from_existing(slots, req.current_slots)
+    if req.slots is not None:
         try:
             raw_slots = req.slots.dict(exclude_none=True)
-            # normalize date_range if provided as string/dict
             dr = raw_slots.get("date_range")
             if isinstance(dr, str):
                 raw_slots["date_range"] = []
@@ -1793,24 +1961,12 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
                 start = dr.get("start_date") or dr.get("start")
                 end = dr.get("end_date") or dr.get("end")
                 raw_slots["date_range"] = [start, end] if (start or end) else []
-            slots = TripPlanRequest.parse_obj(raw_slots)
+            slots = _merge_slots_from_existing(slots, TripPlanRequest.parse_obj(raw_slots))
         except Exception:
             logger.exception("TripChat: failed to parse req.slots")
-            slots = None
-
-    if req.destination:
-        if slots is None:
-            slots = TripPlanRequest()
-        slots.destination = req.destination
-        meta = getattr(slots, "meta", None)
-        if not isinstance(meta, dict):
-            meta = {}
-        meta["destination_source"] = "client"
-        setattr(slots, "meta", meta)
 
     # ----- 4) 猜槽位（目的地/天数/出发地/偏好），并与 slots 融合 -----
     guess_slots = TripPlanRequest()
-    text_merge = req.input_text + "\n" + "\n".join([m.content for m in req.history if m.role == "user"])
     text_origin = _guess_origin(req.input_text)
 
     guess_slots.destination = _guess_destination(text_merge)
@@ -1982,10 +2138,13 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
         trace_id,
     )
     if use_dialog and draft is not None:
-        reply_text = _render_dialog_draft(draft)
+        reply_text = _render_dialog_draft(draft, slots)
 
         resources_out = resources_from_kb if isinstance(resources_from_kb, dict) else {}
         qrs = list(getattr(draft, "quick_replies", None) or [])
+        meta = getattr(slots, "meta", None)
+        if isinstance(meta, dict) and meta.get("route_choice"):
+            qrs = ["元旦", "寒假", "未定", "3大2小", "2大1小", "1人", "轻松", "均衡", "紧凑"]
         if qrs:
             existing = resources_out.setdefault("quick_replies", [])
             if not isinstance(existing, list):
@@ -2083,8 +2242,11 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
         ctx = _build_dialog_context(req, slots, intent, region, days_guess)
         draft, _draft_reply = _call_llm_for_dialog_draft(req, system_content, ctx)
         if draft is not None:
-            reply_text = _render_dialog_draft(draft)
+            reply_text = _render_dialog_draft(draft, slots)
             dialog_quick_replies = list(draft.quick_replies or [])
+            meta = getattr(slots, "meta", None)
+            if isinstance(meta, dict) and meta.get("route_choice"):
+                dialog_quick_replies = ["元旦", "寒假", "未定", "3大2小", "2大1小", "1人", "轻松", "均衡", "紧凑"]
             use_dialog_draft_success = True
     logger.info(
         "dialog_draft_result trace_id=%s success=%s",
