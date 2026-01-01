@@ -157,6 +157,7 @@ class TripChatResponse(BaseModel):
     pending_questions: List[PendingQuestion] = Field(default_factory=list)
     next_action: NextAction = Field(default_factory=NextAction)
     trip_profile: Optional[TripProfile] = None
+    meta: Optional[Dict[str, Any]] = None
 
 
 class RouteOption(BaseModel):
@@ -442,13 +443,13 @@ def _render_discovery_7qs(origin_hint: Optional[str], region_hint: Optional[str]
 
 def _render_region_starter_card(region_value: str, origin_hint: Optional[str]) -> Tuple[str, List[str]]:
     region_text = region_value or "目的地"
-    origin_text = f"从{origin_hint}出发" if origin_hint else "出发地未定"
     lines = [
-        f"{region_text}范围较大，我先给你一个首轮选择卡（{origin_text}）：",
+        "【路线选项】",
+        f"{region_text}三种典型玩法：",
         "【A】经典打卡线：城市地标 + 代表景点，节奏适中",
         "【B】轻松度假线：酒店/温泉/慢游，节奏轻松",
         "【C】主题玩法线：按季节与兴趣选（如滑雪/美食/亲子）",
-        "你更偏 A/B/C？也可以直接告诉我大概几天、几位同行。",
+        "请回复：选A/选B/选C + 大致出发日期 + 同行人数",
     ]
     quick_replies = ["选A", "选B", "选C", "我不确定", "元旦", "寒假", "未定"]
     return "\n".join(lines), quick_replies
@@ -519,6 +520,26 @@ def _fill_defaults(slots: TripPlanRequest) -> TripPlanRequest:
     return TripPlanRequest.parse_obj(data)
 
 
+def _parse_route_choice(text: str) -> Optional[str]:
+    t = text or ""
+    m = re.search(
+        r"(?:路线|线路)?\s*[\(（]?\s*([A-D])\s*[\)）]?\s*(?:线|路线|线路)?",
+        t,
+        re.IGNORECASE,
+    )
+    if m:
+        return m.group(1).upper()
+    if re.search(r"(选A|A线|走A)", t, re.IGNORECASE):
+        return "A"
+    if re.search(r"(选B|B线|走B)", t, re.IGNORECASE):
+        return "B"
+    if re.search(r"(选C|C线|走C)", t, re.IGNORECASE):
+        return "C"
+    if re.search(r"(选D|D线|走D)", t, re.IGNORECASE):
+        return "D"
+    return None
+
+
 def _parse_user_slots(text: str) -> Dict[str, Any]:
     t = text or ""
     result: Dict[str, Any] = {}
@@ -583,21 +604,9 @@ def _parse_user_slots(text: str) -> Dict[str, Any]:
     if tags:
         result["interest_tags"] = tags
 
-    m_route = re.search(
-        r"(?:路线|线路)?\s*[\(（]?\s*([A-D])\s*[\)）]?\s*(?:线|路线|线路)?",
-        t,
-        re.IGNORECASE,
-    )
-    if m_route:
-        result["route_choice"] = m_route.group(1).upper()
-    elif re.search(r"(选A|A线|走A)", t, re.IGNORECASE):
-        result["route_choice"] = "A"
-    elif re.search(r"(选B|B线|走B)", t, re.IGNORECASE):
-        result["route_choice"] = "B"
-    elif re.search(r"(选C|C线|走C)", t, re.IGNORECASE):
-        result["route_choice"] = "C"
-    elif re.search(r"(选D|D线|走D)", t, re.IGNORECASE):
-        result["route_choice"] = "D"
+    route_choice = _parse_route_choice(t)
+    if route_choice:
+        result["route_choice"] = route_choice
     elif re.search(r"(混合|都想要|A和B)", t, re.IGNORECASE):
         result["route_choice"] = "MIX"
 
@@ -1225,6 +1234,35 @@ def _needs_recommendations(text: str) -> bool:
     return bool(re.search(r"(推荐|玩法|特色项目|项目|怎么?玩|攻略|安排|路线)", text or ""))
 
 
+def _normalize_trip_reply(reply: str, mode: Optional[str] = None) -> str:
+    text = (reply or "")
+    if not text.strip():
+        return text
+
+    lines = text.splitlines()
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    text = "\n".join(lines)
+
+    marker = "【路线选项】"
+    if marker in text and not text.startswith(marker):
+        idx = text.find(marker)
+        if idx >= 0:
+            text = text[idx:]
+
+    if re.match(r"^(东北范围较大|范围较大|范围比较大|首轮选择卡|我先给你一个首轮选择卡)", text):
+        region = None
+        m = re.search(
+            r"(东北|华北|华东|华南|西北|西南|川西|江浙沪|大湾区|长三角|珠三角|华中|新疆|内蒙|青甘|西北地区|西南地区)",
+            text,
+        )
+        if m:
+            region = m.group(1)
+        text, _ = _render_region_starter_card(region or "目的地", None)
+
+    return text
+
+
 def _enforce_v1_actions_style(reply_text: str) -> str:
     text = (reply_text or "").strip()
     if not text:
@@ -1389,8 +1427,7 @@ def _select_actions_question(
         if not _should_ask(slot_key, slots, history, current_turn, days_guess):
             continue
         if slot_key == "destination_city":
-            origin_hint = getattr(slots, "origin", None) if slots is not None else None
-            prompt = _render_discovery_7qs(origin_hint=origin_hint, region_hint=region_value)
+            prompt, _ = _render_region_starter_card(region_value, None)
             quick_replies = _region_city_candidates(region_value)
             quick_replies = (quick_replies or []) + ["我还不确定"]
             return slot_key, prompt, quick_replies, slots
@@ -1825,361 +1862,318 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
     trace_id = getattr(request.state, "trace_id", None) or uuid.uuid4().hex
     response.headers["X-Trace-Id"] = trace_id
     date_hint_needed = False
+    try:
 
-    # ----- 出发地提示 -----
-    origin_hint = ""
-    origin_value = req.origin
-    if not origin_value and req.current_slots and getattr(req.current_slots, "origin", None):
-        origin_value = req.current_slots.origin
+        # ----- 出发地提示 -----
+        origin_hint = ""
+        origin_value = req.origin
+        if not origin_value and req.current_slots and getattr(req.current_slots, "origin", None):
+            origin_value = req.current_slots.origin
 
-    system_content = SYSTEM_PROMPT
+        system_content = SYSTEM_PROMPT
 
-    if origin_value:
-        origin_hint = (
-            "系统补充背景信息：用户已经有明确的出发城市，"
-            f"当前假定出发地为“{origin_value}”。"
-            "在规划行程时，请优先以该城市作为出发地。"
+        if origin_value:
+            origin_hint = (
+                "系统补充背景信息：用户已经有明确的出发城市，"
+                f"当前假定出发地为“{origin_value}”。"
+                "在规划行程时，请优先以该城市作为出发地。"
+            )
+        elif req.default_origin:
+            origin_hint = (
+                "系统补充背景信息：根据用户最近一次定位推断，"
+                f"用户大概率位于“{req.default_origin}”。"
+                "如果用户在对话中没有特别说明出发城市，可暂时以此作为出发地；"
+                "一旦用户提供了新的出发城市，请以用户的最新说明为准。"
+            )
+
+        if origin_hint:
+            system_content = SYSTEM_PROMPT + "\n\n" + origin_hint
+
+        logger.info(
+            "TripChat origin=%s default_origin=%s user_lat=%s user_lng=%s",
+            origin_value,
+            req.default_origin,
+            req.user_lat,
+            req.user_lng,
         )
-    elif req.default_origin:
-        origin_hint = (
-            "系统补充背景信息：根据用户最近一次定位推断，"
-            f"用户大概率位于“{req.default_origin}”。"
-            "如果用户在对话中没有特别说明出发城市，可暂时以此作为出发地；"
-            "一旦用户提供了新的出发城市，请以用户的最新说明为准。"
-        )
 
-    if origin_hint:
-        system_content = SYSTEM_PROMPT + "\n\n" + origin_hint
+        # ----- 0) 中断优先：讲故事/笑话/情绪安抚，先接住再说 -----
+        if _is_interrupt(req.input_text):
+            reply_text = _render_interrupt_reply(req.input_text)
 
-    logger.info(
-        "TripChat origin=%s default_origin=%s user_lat=%s user_lng=%s",
-        origin_value,
-        req.default_origin,
-        req.user_lat,
-        req.user_lng,
-    )
+            history_with_new_user = list(req.history or [])
+            if not history_with_new_user:
+                history_with_new_user = [ChatMessage(role="user", content=req.input_text)]
+            else:
+                last = history_with_new_user[-1]
+                if not (
+                    last.role == "user"
+                    and (last.content or "").strip() == (req.input_text or "").strip()
+                ):
+                    history_with_new_user.append(ChatMessage(role="user", content=req.input_text))
 
-    # ----- 0) 中断优先：讲故事/笑话/情绪安抚，先接住再说 -----
-    if _is_interrupt(req.input_text):
-        reply_text = _render_interrupt_reply(req.input_text)
+            new_history = list(history_with_new_user) + [
+                ChatMessage(role="assistant", content=reply_text)
+            ]
 
-        history_with_new_user = list(req.history or [])
+            resources_out = {
+                "quick_replies": ["继续规划", "我想看路线选项", "换个目的地", "改预算档位", "改出行日期"]
+            }
+
+            return TripChatResponse(
+                reply=reply_text,
+                history=new_history,
+                slots=None,
+                trip_plan=None,
+                resources=resources_out,
+                mode="CHAT",
+                dialog_state=DialogState.PAUSED,
+                pending_questions=[],
+                next_action=NextAction(reason="interrupt"),
+            )
+
+        # ----- 1) 知识库：不再早退，只先记录 resources -----
+        kb_res = kb.kb_search(kb.KbSearch(query=req.input_text, destination=""))
+        kb_items = kb_res.get("items") if kb_res else []
+        resources_from_kb = _kb_to_resources(kb_items) if kb_items else None
+
+        # ----- 2) 调 LLM（强约束 JSON，仅推荐场景使用） -----
+        reply_text = ""
+        parsed_json = None
+        decision_used = None
+
+        if _needs_recommendations(req.input_text):
+            _raw_json_reply, parsed_json, decision_used = _call_llm_for_json(req, system_content)
+
+        # 只把“本轮用户消息”先加进 history，用于统计 user_turns
+        history_with_new_user = list(req.history)
         if not history_with_new_user:
             history_with_new_user = [ChatMessage(role="user", content=req.input_text)]
         else:
             last = history_with_new_user[-1]
-            if not (
+            same_user = (
                 last.role == "user"
                 and (last.content or "").strip() == (req.input_text or "").strip()
-            ):
+            )
+            if not same_user:
                 history_with_new_user.append(ChatMessage(role="user", content=req.input_text))
+        user_turns = _count_user_turns(history_with_new_user)
+        _ = user_turns  # 保留变量以避免未来逻辑改动时被误删
 
-        new_history = list(history_with_new_user) + [
-            ChatMessage(role="assistant", content=reply_text)
-        ]
-
-        resources_out = {
-            "quick_replies": ["继续规划", "我想看路线选项", "换个目的地", "改预算档位", "改出行日期"]
-        }
-
-        return TripChatResponse(
-            reply=reply_text,
-            history=new_history,
-            slots=None,
-            trip_plan=None,
-            resources=resources_out,
-            mode="CHAT",
-            dialog_state=DialogState.PAUSED,
-            pending_questions=[],
-            next_action=NextAction(reason="interrupt"),
+        text_merge = req.input_text + "\n" + "\n".join(
+            [m.content for m in history_with_new_user if m.role == "user"]
         )
+        days_guess = _guess_days(text_merge)
 
-    # ----- 1) 知识库：不再早退，只先记录 resources -----
-    kb_res = kb.kb_search(kb.KbSearch(query=req.input_text, destination=""))
-    kb_items = kb_res.get("items") if kb_res else []
-    resources_from_kb = _kb_to_resources(kb_items) if kb_items else None
-
-    # ----- 2) 调 LLM（强约束 JSON，仅推荐场景使用） -----
-    reply_text = ""
-    parsed_json = None
-    decision_used = None
-
-    if _needs_recommendations(req.input_text):
-        _raw_json_reply, parsed_json, decision_used = _call_llm_for_json(req, system_content)
-
-    # 只把“本轮用户消息”先加进 history，用于统计 user_turns
-    history_with_new_user = list(req.history)
-    if not history_with_new_user:
-        history_with_new_user = [ChatMessage(role="user", content=req.input_text)]
-    else:
-        last = history_with_new_user[-1]
-        same_user = (
-            last.role == "user"
-            and (last.content or "").strip() == (req.input_text or "").strip()
-        )
-        if not same_user:
-            history_with_new_user.append(ChatMessage(role="user", content=req.input_text))
-    user_turns = _count_user_turns(history_with_new_user)
-    _ = user_turns  # 保留变量以避免未来逻辑改动时被误删
-
-    text_merge = req.input_text + "\n" + "\n".join(
-        [m.content for m in history_with_new_user if m.role == "user"]
-    )
-    days_guess = _guess_days(text_merge)
-
-    # ----- 3) 解析 slots_json，或用 current_slots -----
-    slots_from_llm: Optional[TripPlanRequest] = None
-    try:
-        if getattr(decision_used, "slots_json", None):
-            raw_slots = json.loads(decision_used.slots_json) or {}
-            # 补充用户坐标
-            if req.location_lat is not None:
-                raw_slots.setdefault("user_lat", req.location_lat)
-            elif req.user_lat is not None:
-                raw_slots.setdefault("user_lat", req.user_lat)
-            if req.location_lng is not None:
-                raw_slots.setdefault("user_lng", req.location_lng)
-            elif req.user_lng is not None:
-                raw_slots.setdefault("user_lng", req.user_lng)
-            slots_from_llm = TripPlanRequest.parse_obj(raw_slots)
-    except Exception:
-        logger.exception("TripChat: failed to parse slots_json")
-        slots_from_llm = None
-
-    slots = _rebuild_slots_from_history(
-        req.origin, req.destination, history_with_new_user, days_guess
-    )
-    slots = _merge_slots_from_existing(slots, slots_from_llm)
-    slots = _merge_slots_from_existing(slots, req.current_slots)
-    if req.slots is not None:
+        # ----- 3) 解析 slots_json，或用 current_slots -----
+        slots_from_llm: Optional[TripPlanRequest] = None
         try:
-            raw_slots = req.slots.dict(exclude_none=True)
-            dr = raw_slots.get("date_range")
-            if isinstance(dr, str):
-                raw_slots["date_range"] = []
-            elif isinstance(dr, dict):
-                start = dr.get("start_date") or dr.get("start")
-                end = dr.get("end_date") or dr.get("end")
-                raw_slots["date_range"] = [start, end] if (start or end) else []
-            slots = _merge_slots_from_existing(slots, TripPlanRequest.parse_obj(raw_slots))
+            if getattr(decision_used, "slots_json", None):
+                raw_slots = json.loads(decision_used.slots_json) or {}
+                # 补充用户坐标
+                if req.location_lat is not None:
+                    raw_slots.setdefault("user_lat", req.location_lat)
+                elif req.user_lat is not None:
+                    raw_slots.setdefault("user_lat", req.user_lat)
+                if req.location_lng is not None:
+                    raw_slots.setdefault("user_lng", req.location_lng)
+                elif req.user_lng is not None:
+                    raw_slots.setdefault("user_lng", req.user_lng)
+                slots_from_llm = TripPlanRequest.parse_obj(raw_slots)
         except Exception:
-            logger.exception("TripChat: failed to parse req.slots")
+            logger.exception("TripChat: failed to parse slots_json")
+            slots_from_llm = None
 
-    # ----- 4) 猜槽位（目的地/天数/出发地/偏好），并与 slots 融合 -----
-    guess_slots = TripPlanRequest()
-    text_origin = _guess_origin(req.input_text)
+        slots = _rebuild_slots_from_history(
+            req.origin, req.destination, history_with_new_user, days_guess
+        )
+        slots = _merge_slots_from_existing(slots, slots_from_llm)
+        slots = _merge_slots_from_existing(slots, req.current_slots)
+        if req.slots is not None:
+            try:
+                raw_slots = req.slots.dict(exclude_none=True)
+                dr = raw_slots.get("date_range")
+                if isinstance(dr, str):
+                    raw_slots["date_range"] = []
+                elif isinstance(dr, dict):
+                    start = dr.get("start_date") or dr.get("start")
+                    end = dr.get("end_date") or dr.get("end")
+                    raw_slots["date_range"] = [start, end] if (start or end) else []
+                slots = _merge_slots_from_existing(slots, TripPlanRequest.parse_obj(raw_slots))
+            except Exception:
+                logger.exception("TripChat: failed to parse req.slots")
 
-    guess_slots.destination = _guess_destination(text_merge)
-    days = _guess_days(text_merge)
-    if days:
-        # 目前仅用“天数存在”作为信号，不强行构造 date_range
-        guess_slots.date_range = []
-    guess_slots.origin = _guess_origin(text_merge)
-    guess_slots.preferences = _guess_preferences(text_merge)
+        # ----- 4) 猜槽位（目的地/天数/出发地/偏好），并与 slots 融合 -----
+        guess_slots = TripPlanRequest()
+        text_origin = _guess_origin(req.input_text)
 
-    # 如果完全没有 slots，但猜到目的地，则使用 guess_slots
-    if slots is None and guess_slots.destination:
-        slots = guess_slots
+        guess_slots.destination = _guess_destination(text_merge)
+        days = _guess_days(text_merge)
+        if days:
+            # 目前仅用“天数存在”作为信号，不强行构造 date_range
+            guess_slots.date_range = []
+        guess_slots.origin = _guess_origin(text_merge)
+        guess_slots.preferences = _guess_preferences(text_merge)
 
-    # 用猜测结果补齐 slots 中缺失字段（不覆盖已有值）
-    if slots is not None:
-        if not getattr(slots, "destination", None) and getattr(guess_slots, "destination", None):
-            slots.destination = guess_slots.destination
-        if text_origin:
-            _set_origin_with_source(slots, text_origin, "text")
-        elif not getattr(slots, "origin", None) and getattr(guess_slots, "origin", None):
-            _set_origin_with_source(slots, guess_slots.origin, "text")
-        if not getattr(slots, "preferences", None) and getattr(guess_slots, "preferences", None):
-            slots.preferences = guess_slots.preferences
+        # 如果完全没有 slots，但猜到目的地，则使用 guess_slots
+        if slots is None and guess_slots.destination:
+            slots = guess_slots
 
-        # 若仍无 origin，尝试用显式 origin 或 default_origin 补上
-        if not getattr(slots, "origin", None):
-            if origin_value:
-                _set_origin_with_source(slots, origin_value, "location")
-            elif req.default_origin:
-                _set_origin_with_source(slots, req.default_origin, "location")
+        # 用猜测结果补齐 slots 中缺失字段（不覆盖已有值）
+        if slots is not None:
+            if not getattr(slots, "destination", None) and getattr(guess_slots, "destination", None):
+                slots.destination = guess_slots.destination
+            if text_origin:
+                _set_origin_with_source(slots, text_origin, "text")
+            elif not getattr(slots, "origin", None) and getattr(guess_slots, "origin", None):
+                _set_origin_with_source(slots, guess_slots.origin, "text")
+            if not getattr(slots, "preferences", None) and getattr(guess_slots, "preferences", None):
+                slots.preferences = guess_slots.preferences
 
-        # ----- 4.1) 确定性日期解析：优先在缺字段判定之前写回 slots -----
-        if not _valid_date_range(getattr(slots, "date_range", None)):
-            extracted = extract_cn_date_range(text_merge)
-            if extracted:
-                slots.date_range = [extracted["start_date"], extracted["end_date"]]
-                logger.info("TripChat date_range extracted trace_id=%s date_range=%s", trace_id, slots.date_range)
-            else:
-                inferred = infer_cn_date_range_from_text(text_merge)
-                if inferred:
-                    slots.date_range = [inferred["start_date"], inferred["end_date"]]
-                    date_hint_needed = True
-                    logger.info("TripChat date_range inferred trace_id=%s date_range=%s", trace_id, slots.date_range)
+            # 若仍无 origin，尝试用显式 origin 或 default_origin 补上
+            if not getattr(slots, "origin", None):
+                if origin_value:
+                    _set_origin_with_source(slots, origin_value, "location")
+                elif req.default_origin:
+                    _set_origin_with_source(slots, req.default_origin, "location")
 
-        # 只要是“节假日/周末”等表达且没有明确日期范围，就加轻提示（不阻断生成）
-        if not extract_cn_date_range(text_merge) and re.search(
-            r"(元旦|节假日|周末|本周末|下周末|五一|劳动节|国庆|春节)",
-            text_merge,
-        ):
-            date_hint_needed = True
+            # ----- 4.1) 确定性日期解析：优先在缺字段判定之前写回 slots -----
+            if not _valid_date_range(getattr(slots, "date_range", None)):
+                extracted = extract_cn_date_range(text_merge)
+                if extracted:
+                    slots.date_range = [extracted["start_date"], extracted["end_date"]]
+                    logger.info("TripChat date_range extracted trace_id=%s date_range=%s", trace_id, slots.date_range)
+                else:
+                    inferred = infer_cn_date_range_from_text(text_merge)
+                    if inferred:
+                        slots.date_range = [inferred["start_date"], inferred["end_date"]]
+                        date_hint_needed = True
+                        logger.info("TripChat date_range inferred trace_id=%s date_range=%s", trace_id, slots.date_range)
 
-    # ----- 4.15) 解析用户显式槽位并合并 -----
-    slots = _merge_slots(slots, _parse_user_slots(req.input_text))
-    slots = _infer_profile_from_slots(slots)
-    if slots is not None and _is_refusal(req.input_text):
-        last = _last_asked_slot(slots)
-        if last:
-            _mark_declined(slots, last)
-        if last in {"destination_city", "traveler_count", "budget_level", "preferences"}:
-            dest_key = _normalize_dest_key(getattr(slots, "destination", None) or req.destination, text_merge)
-            region_value = _pick_region(text_merge) if _is_region_query(text_merge) else None
-            archetype = _route_archetype(dest_key, text_merge, region_value)
-            reply_text, actions_quick_replies = _render_actions_starter(
-                archetype,
-                dest_key,
-                _guess_days(text_merge),
-                origin_value or req.default_origin or req.origin,
-                text=req.input_text,
-            )
-            reply_text = (reply_text or "") + "\n\n你只要回 1 条即可。"
-            resources_out = resources_from_kb if isinstance(resources_from_kb, dict) else {}
-            if actions_quick_replies:
-                resources_out["quick_replies"] = actions_quick_replies[:12]
-            new_history = list(history_with_new_user) + [ChatMessage(role="assistant", content=reply_text)]
-            slot_completeness = SlotCompleteness(
-                required_done=_estimate_required_done(slots),
-                required_total=4,
-            )
-            return TripChatResponse(
-                reply=reply_text,
-                history=new_history,
-                slots=slots,
-                trip_plan=None,
-                resources=resources_out,
-                mode="EXPLORE",
-                dialog_state=DialogState.DISCOVERY,
-                slot_completeness=slot_completeness,
-                pending_questions=[],
-                next_action=NextAction(type="NONE", reason="user_declined"),
-                trip_profile=_build_trip_profile(slots),
-            )
+            # 只要是“节假日/周末”等表达且没有明确日期范围，就加轻提示（不阻断生成）
+            if not extract_cn_date_range(text_merge) and re.search(
+                r"(元旦|节假日|周末|本周末|下周末|五一|劳动节|国庆|春节)",
+                text_merge,
+            ):
+                date_hint_needed = True
 
-    # ---- DialogDraft takeover (V1) ----
-    intent = _classify_intent(req.input_text)
-    # ----- 意图修正：在旅行上下文里，纯地名输入也应视为 explore -----
-    if getattr(slots, "destination", None) and len((req.input_text or "").strip()) <= 8:
-        intent = "explore"
-    region = _pick_region(text_merge) if _is_region_query(text_merge) else None
-    days_guess = _guess_days(text_merge)
-    has_user_origin = bool(req.origin) or (
-        bool(getattr(slots, "origin", None)) and getattr(slots, "origin", None) != req.default_origin
-    )
-    missing_required = _evaluate_missing_required(slots, days_guess, has_user_origin)
-    actions_intent = (intent in {"plan", "explore"} or _needs_recommendations(req.input_text))
-    region_value = None
-    if slots is not None and _is_region_destination_value(getattr(slots, "destination", None)):
-        region_value = slots.destination
-    if not region_value:
-        region_hit = _extract_region_from_text(text_merge)
-        if region_hit:
-            region_value = region_hit
-            if slots is None:
-                slots = TripPlanRequest()
-            slots.destination = region_hit
-    if region_value and user_turns <= 2:
-        meta = _ensure_meta(slots)
-        if not meta.get("starter_card_shown"):
-            meta["starter_card_shown"] = True
-            reply_text, starter_quick_replies = _render_region_starter_card(
-                region_value,
-                origin_value or req.default_origin or req.origin,
-            )
-            resources_out = resources_from_kb if isinstance(resources_from_kb, dict) else {}
-            if starter_quick_replies:
-                resources_out["quick_replies"] = starter_quick_replies[:12]
-            new_history = list(history_with_new_user) + [ChatMessage(role="assistant", content=reply_text)]
-            slot_completeness = SlotCompleteness(
-                required_done=_estimate_required_done(slots),
-                required_total=4,
-            )
-            return TripChatResponse(
-                reply=reply_text,
-                history=new_history,
-                slots=slots,
-                trip_plan=None,
-                resources=resources_out,
-                mode="EXPLORE",
-                dialog_state=DialogState.DISCOVERY,
-                slot_completeness=slot_completeness,
-                pending_questions=[],
-                next_action=NextAction(type="ASK", reason="starter_card"),
-                trip_profile=_build_trip_profile(slots),
-            )
-    suggested_quick_replies: List[str] = []
-    actions_slot_key, actions_prompt, actions_quick_replies, slots = _select_actions_question(
-        slots,
-        text_merge,
-        days_guess,
-        history_with_new_user,
-        user_turns,
-    )
-    if actions_intent and actions_prompt and not _detect_refine_intent(req.input_text):
-        suggested_quick_replies = actions_quick_replies or []
-    use_dialog = (
-        (intent in {"plan", "explore"} or _needs_recommendations(req.input_text))
-        and (missing_required or region)
-        and not _detect_refine_intent(req.input_text)
-    )
-    draft = None
-    draft_reply = None
-    if use_dialog:
-        ctx = _build_dialog_context(req, slots, intent, region, days_guess)
-        draft, draft_reply = _call_llm_for_dialog_draft(req, system_content, ctx)
-    logger.info(
-        "dialog_draft_takeover use_dialog=%s ok=%s trace_id=%s",
-        use_dialog,
-        draft is not None,
-        trace_id,
-    )
-    if use_dialog and draft is not None:
-        reply_text = _render_dialog_draft(draft, slots)
+        # ----- 4.15) 解析用户显式槽位并合并 -----
+        slots = _merge_slots(slots, _parse_user_slots(req.input_text))
+        slots = _infer_profile_from_slots(slots)
 
-        resources_out = resources_from_kb if isinstance(resources_from_kb, dict) else {}
-        qrs = list(getattr(draft, "quick_replies", None) or [])
+        if slots is not None and _is_refusal(req.input_text):
+            last = _last_asked_slot(slots)
+            if last:
+                _mark_declined(slots, last)
+            if last in {"destination_city", "traveler_count", "budget_level", "preferences"}:
+                meta = getattr(slots, "meta", None)
+                route_choice = meta.get("route_choice") if isinstance(meta, dict) else None
+                if route_choice:
+                    followup = _pick_followup_question(
+                        slots, history_with_new_user, user_turns, _guess_days(text_merge)
+                    )
+                    reply_text = (
+                        followup["prompt"]
+                        if followup
+                        else "已收到，你可以补充出行时间/人数/预算中的任意一项。"
+                    )
+                    resources_out = resources_from_kb if isinstance(resources_from_kb, dict) else {}
+                    qrs = followup.get("quick_replies") if followup else None
+                    if qrs:
+                        resources_out["quick_replies"] = qrs[:12]
+                else:
+                    dest_key = _normalize_dest_key(
+                        getattr(slots, "destination", None) or req.destination, text_merge
+                    )
+                    region_value = _pick_region(text_merge) if _is_region_query(text_merge) else None
+                    archetype = _route_archetype(dest_key, text_merge, region_value)
+                    reply_text, actions_quick_replies = _render_actions_starter(
+                        archetype,
+                        dest_key,
+                        _guess_days(text_merge),
+                        origin_value or req.default_origin or req.origin,
+                        text=req.input_text,
+                    )
+                    reply_text = (reply_text or "") + "\n\n你只要回 1 条即可。"
+                    resources_out = resources_from_kb if isinstance(resources_from_kb, dict) else {}
+                    if actions_quick_replies:
+                        resources_out["quick_replies"] = actions_quick_replies[:12]
+
+                new_history = list(history_with_new_user) + [
+                    ChatMessage(role="assistant", content=reply_text)
+                ]
+                slot_completeness = SlotCompleteness(
+                    required_done=_estimate_required_done(slots),
+                    required_total=4,
+                )
+                return TripChatResponse(
+                    reply=reply_text,
+                    history=new_history,
+                    slots=slots,
+                    trip_plan=None,
+                    resources=resources_out,
+                    mode="EXPLORE",
+                    dialog_state=DialogState.DISCOVERY,
+                    slot_completeness=slot_completeness,
+                    pending_questions=[],
+                    next_action=NextAction(type="NONE", reason="user_declined"),
+                    trip_profile=_build_trip_profile(slots),
+                )
+
+        # ---- DialogDraft takeover (V1) ----
+        intent = _classify_intent(req.input_text)
+        # ----- 意图修正：在旅行上下文里，纯地名输入也应视为 explore -----
+        if getattr(slots, "destination", None) and len((req.input_text or "").strip()) <= 8:
+            intent = "explore"
+        region = _pick_region(text_merge) if _is_region_query(text_merge) else None
+        days_guess = _guess_days(text_merge)
+        has_user_origin = bool(req.origin) or (
+            bool(getattr(slots, "origin", None)) and getattr(slots, "origin", None) != req.default_origin
+        )
+        missing_required = _evaluate_missing_required(slots, days_guess, has_user_origin)
+        actions_intent = (intent in {"plan", "explore"} or _needs_recommendations(req.input_text))
+        region_value = None
+        if slots is not None and _is_region_destination_value(getattr(slots, "destination", None)):
+            region_value = slots.destination
+        if not region_value:
+            region_hit = _extract_region_from_text(text_merge)
+            if region_hit:
+                region_value = region_hit
+                if slots is None:
+                    slots = TripPlanRequest()
+                slots.destination = region_hit
         meta = getattr(slots, "meta", None)
-        if isinstance(meta, dict) and meta.get("route_choice"):
-            qrs = ["元旦", "寒假", "未定", "3大2小", "2大1小", "1人", "轻松", "均衡", "紧凑"]
-        if qrs:
-            existing = resources_out.setdefault("quick_replies", [])
-            if not isinstance(existing, list):
-                existing = []
-                resources_out["quick_replies"] = existing
-            for x in qrs:
-                if x and x not in existing:
-                    existing.append(x)
-            resources_out["quick_replies"] = existing[:12]
-
-        new_history = list(history_with_new_user) + [ChatMessage(role="assistant", content=reply_text)]
-        slot_completeness = SlotCompleteness(
-            required_done=_estimate_required_done(slots),
-            required_total=4,
-        )
-        return TripChatResponse(
-            reply=reply_text,
-            history=new_history,
-            slots=slots,
-            trip_plan=None,
-            resources=resources_out,
-            mode="EXPLORE",
-            dialog_state=DialogState.DISCOVERY,
-            slot_completeness=slot_completeness,
-            pending_questions=[],
-            next_action=NextAction(type="ASK", reason="dialog_draft"),
-            trip_profile=_build_trip_profile(slots),
-        )
-    if use_dialog and draft is None:
-        reply_preview = (draft_reply or "")[:200]
-        logger.warning(
-            "dialog_draft_failed trace_id=%s reply_preview=%s",
-            trace_id,
-            reply_preview,
-        )
+        route_choice = meta.get("route_choice") if isinstance(meta, dict) else None
+        if region_value and user_turns <= 2 and not route_choice:
+            meta = _ensure_meta(slots)
+            if not meta.get("starter_card_shown"):
+                meta["starter_card_shown"] = True
+                reply_text, starter_quick_replies = _render_region_starter_card(
+                    region_value,
+                    origin_value or req.default_origin or req.origin,
+                )
+                resources_out = resources_from_kb if isinstance(resources_from_kb, dict) else {}
+                if starter_quick_replies:
+                    resources_out["quick_replies"] = starter_quick_replies[:12]
+                new_history = list(history_with_new_user) + [ChatMessage(role="assistant", content=reply_text)]
+                slot_completeness = SlotCompleteness(
+                    required_done=_estimate_required_done(slots),
+                    required_total=4,
+                )
+                return TripChatResponse(
+                    reply=reply_text,
+                    history=new_history,
+                    slots=slots,
+                    trip_plan=None,
+                    resources=resources_out,
+                    mode="EXPLORE",
+                    dialog_state=DialogState.DISCOVERY,
+                    slot_completeness=slot_completeness,
+                    pending_questions=[],
+                    next_action=NextAction(type="ASK", reason="starter_card"),
+                    trip_profile=_build_trip_profile(slots),
+                )
+        suggested_quick_replies: List[str] = []
         actions_slot_key, actions_prompt, actions_quick_replies, slots = _select_actions_question(
             slots,
             text_merge,
@@ -2187,34 +2181,47 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
             history_with_new_user,
             user_turns,
         )
-        if actions_prompt:
+        if actions_intent and actions_prompt and not _detect_refine_intent(req.input_text):
             suggested_quick_replies = actions_quick_replies or []
+        use_dialog = (
+            (intent in {"plan", "explore"} or _needs_recommendations(req.input_text))
+            and (missing_required or region)
+            and not _detect_refine_intent(req.input_text)
+        )
+        draft = None
+        draft_reply = None
+        if use_dialog:
+            ctx = _build_dialog_context(req, slots, intent, region, days_guess)
+            draft, draft_reply = _call_llm_for_dialog_draft(req, system_content, ctx)
+        logger.info(
+            "dialog_draft_takeover use_dialog=%s ok=%s trace_id=%s",
+            use_dialog,
+            draft is not None,
+            trace_id,
+        )
+        if use_dialog and draft is not None:
+            reply_text = _render_dialog_draft(draft, slots)
 
-    # ----- 4.2) empty/generic reply fallback -----
-    destination_value = slots.destination if slots is not None else None
-    intent = _classify_intent(req.input_text)
-    # ----- 意图修正：在旅行上下文里，纯地名输入也应视为 explore -----
-    if getattr(slots, "destination", None) and len((req.input_text or "").strip()) <= 8:
-        intent = "explore"
-    region = _pick_region(text_merge) if _is_region_query(text_merge) else None
-    should_plan = intent == "plan" and not (region and not destination_value)
-    days_guess = _guess_days(text_merge)
-    has_user_origin = bool(req.origin) or (
-        bool(getattr(slots, "origin", None)) and getattr(slots, "origin", None) != req.default_origin
-    )
-    missing_required = _evaluate_missing_required(slots, days_guess, has_user_origin)
-    # ----- 强制推进：有目的地但关键槽位缺失时，一定要问问题 -----
-    destination_value = getattr(slots, "destination", None) if slots is not None else None
-    if destination_value and missing_required:
-        followup = _pick_followup_question(slots, history_with_new_user, user_turns, _guess_days(text_merge))
-        if followup:
-            reply_text = followup["prompt"]
             resources_out = resources_from_kb if isinstance(resources_from_kb, dict) else {}
-            qrs = followup.get("quick_replies") or []
+            qrs = list(getattr(draft, "quick_replies", None) or [])
+            meta = getattr(slots, "meta", None)
+            if isinstance(meta, dict) and meta.get("route_choice"):
+                qrs = ["元旦", "寒假", "未定", "3大2小", "2大1小", "1人", "轻松", "均衡", "紧凑"]
             if qrs:
-                resources_out["quick_replies"] = qrs[:12]
+                existing = resources_out.setdefault("quick_replies", [])
+                if not isinstance(existing, list):
+                    existing = []
+                    resources_out["quick_replies"] = existing
+                for x in qrs:
+                    if x and x not in existing:
+                        existing.append(x)
+                resources_out["quick_replies"] = existing[:12]
 
             new_history = list(history_with_new_user) + [ChatMessage(role="assistant", content=reply_text)]
+            slot_completeness = SlotCompleteness(
+                required_done=_estimate_required_done(slots),
+                required_total=4,
+            )
             return TripChatResponse(
                 reply=reply_text,
                 history=new_history,
@@ -2223,372 +2230,466 @@ def trip_chat(req: TripChatRequest, response: Response, request: Request) -> Tri
                 resources=resources_out,
                 mode="EXPLORE",
                 dialog_state=DialogState.DISCOVERY,
-                slot_completeness=SlotCompleteness(
-                    required_done=_estimate_required_done(slots), required_total=4
-                ),
+                slot_completeness=slot_completeness,
                 pending_questions=[],
-                next_action=NextAction(type="ASK", reason="force_followup"),
+                next_action=NextAction(type="ASK", reason="dialog_draft"),
                 trip_profile=_build_trip_profile(slots),
             )
-    refine_intent = _detect_refine_intent(req.input_text)
-    dest_key = _normalize_dest_key(destination_value or req.destination, text_merge)
-    use_dialog_draft = False
-    use_dialog_draft_success = False
-    dialog_quick_replies: List[str] = []
-    if (intent in {"plan", "explore"} or _needs_recommendations(req.input_text)) and not refine_intent:
-        if missing_required or region or dest_key in {"东北"}:
-            use_dialog_draft = True
-    if use_dialog_draft:
-        ctx = _build_dialog_context(req, slots, intent, region, days_guess)
-        draft, _draft_reply = _call_llm_for_dialog_draft(req, system_content, ctx)
-        if draft is not None:
-            reply_text = _render_dialog_draft(draft, slots)
-            dialog_quick_replies = list(draft.quick_replies or [])
-            meta = getattr(slots, "meta", None)
-            if isinstance(meta, dict) and meta.get("route_choice"):
-                dialog_quick_replies = ["元旦", "寒假", "未定", "3大2小", "2大1小", "1人", "轻松", "均衡", "紧凑"]
-            use_dialog_draft_success = True
-    logger.info(
-        "dialog_draft_result trace_id=%s success=%s",
-        trace_id,
-        use_dialog_draft_success,
-    )
-    origin_conflict_note = ""
-    if slots is not None and req.origin and getattr(slots, "origin", None) and req.origin != slots.origin:
-        origin_conflict_note = (
-            f"我检测到你当前定位在{req.origin}，但你说从{slots.origin}出发。"
-            f"行程以{slots.origin}出发为准对吗？"
+        if use_dialog and draft is None:
+            reply_preview = (draft_reply or "")[:200]
+            logger.warning(
+                "dialog_draft_failed trace_id=%s reply_preview=%s",
+                trace_id,
+                reply_preview,
+            )
+            actions_slot_key, actions_prompt, actions_quick_replies, slots = _select_actions_question(
+                slots,
+                text_merge,
+                days_guess,
+                history_with_new_user,
+                user_turns,
+            )
+            if actions_prompt:
+                suggested_quick_replies = actions_quick_replies or []
+
+        # ----- 4.2) empty/generic reply fallback -----
+        destination_value = slots.destination if slots is not None else None
+        intent = _classify_intent(req.input_text)
+        # ----- 意图修正：在旅行上下文里，纯地名输入也应视为 explore -----
+        if getattr(slots, "destination", None) and len((req.input_text or "").strip()) <= 8:
+            intent = "explore"
+        region = _pick_region(text_merge) if _is_region_query(text_merge) else None
+        should_plan = intent == "plan" and not (region and not destination_value)
+        days_guess = _guess_days(text_merge)
+        has_user_origin = bool(req.origin) or (
+            bool(getattr(slots, "origin", None)) and getattr(slots, "origin", None) != req.default_origin
+        )
+        missing_required = _evaluate_missing_required(slots, days_guess, has_user_origin)
+        # ----- 强制推进：有目的地但关键槽位缺失时，一定要问问题 -----
+        destination_value = getattr(slots, "destination", None) if slots is not None else None
+        if destination_value and missing_required:
+            followup = _pick_followup_question(slots, history_with_new_user, user_turns, _guess_days(text_merge))
+            if followup:
+                reply_text = followup["prompt"]
+                resources_out = resources_from_kb if isinstance(resources_from_kb, dict) else {}
+                qrs = followup.get("quick_replies") or []
+                if qrs:
+                    resources_out["quick_replies"] = qrs[:12]
+
+                new_history = list(history_with_new_user) + [ChatMessage(role="assistant", content=reply_text)]
+                return TripChatResponse(
+                    reply=reply_text,
+                    history=new_history,
+                    slots=slots,
+                    trip_plan=None,
+                    resources=resources_out,
+                    mode="EXPLORE",
+                    dialog_state=DialogState.DISCOVERY,
+                    slot_completeness=SlotCompleteness(
+                        required_done=_estimate_required_done(slots), required_total=4
+                    ),
+                    pending_questions=[],
+                    next_action=NextAction(type="ASK", reason="force_followup"),
+                    trip_profile=_build_trip_profile(slots),
+                )
+        refine_intent = _detect_refine_intent(req.input_text)
+        dest_key = _normalize_dest_key(destination_value or req.destination, text_merge)
+        use_dialog_draft = False
+        use_dialog_draft_success = False
+        dialog_quick_replies: List[str] = []
+        if (intent in {"plan", "explore"} or _needs_recommendations(req.input_text)) and not refine_intent:
+            if missing_required or region or dest_key in {"东北"}:
+                use_dialog_draft = True
+        if use_dialog_draft:
+            ctx = _build_dialog_context(req, slots, intent, region, days_guess)
+            draft, _draft_reply = _call_llm_for_dialog_draft(req, system_content, ctx)
+            if draft is not None:
+                reply_text = _render_dialog_draft(draft, slots)
+                dialog_quick_replies = list(draft.quick_replies or [])
+                meta = getattr(slots, "meta", None)
+                if isinstance(meta, dict) and meta.get("route_choice"):
+                    dialog_quick_replies = ["元旦", "寒假", "未定", "3大2小", "2大1小", "1人", "轻松", "均衡", "紧凑"]
+                use_dialog_draft_success = True
+        logger.info(
+            "dialog_draft_result trace_id=%s success=%s",
+            trace_id,
+            use_dialog_draft_success,
+        )
+        origin_conflict_note = ""
+        if slots is not None and req.origin and getattr(slots, "origin", None) and req.origin != slots.origin:
+            origin_conflict_note = (
+                f"我检测到你当前定位在{req.origin}，但你说从{slots.origin}出发。"
+                f"行程以{slots.origin}出发为准对吗？"
+            )
+
+        generic_explore_reply = "\n".join(
+            [
+                "先给你一个探索方向的概览：",
+                "1）核心城市打卡：地标 + 城市气质体验。",
+                "2）自然山水线：山林/湖海/国家公园。",
+                "3）美食与夜景线：本地必吃 + 夜市/夜景。",
+                "你更偏好哪一类，或计划玩几天？",
+            ]
         )
 
-    generic_explore_reply = "\n".join(
-        [
-            "先给你一个探索方向的概览：",
-            "1）核心城市打卡：地标 + 城市气质体验。",
-            "2）自然山水线：山林/湖海/国家公园。",
-            "3）美食与夜景线：本地必吃 + 夜市/夜景。",
-            "你更偏好哪一类，或计划玩几天？",
-        ]
-    )
+        def _build_plan_followup_text() -> str:
+            skeleton_lines = [
+                "我可以帮你做行程规划，先补两点关键信息：",
+                "A. 目的地与出发地（若已确定其一可跳过）。",
+                "B. 出行日期与人数。",
+            ]
+            questions = []
+            priorities = [
+                ("目的地", not destination_value),
+                ("出行日期", slots is None or not _valid_date_range(getattr(slots, "date_range", None))),
+                (
+                    "同行人数",
+                    slots is None
+                    or (getattr(slots, "adults", None) is None and getattr(slots, "people_count", None) is None),
+                ),
+                ("出发地", slots is None or not getattr(slots, "origin", None)),
+            ]
+            for label, needed in priorities:
+                if needed:
+                    questions.append(label)
+                if len(questions) >= 1:
+                    break
+            if questions:
+                skeleton_lines.append(f"先确认：{questions[0]}。")
+            else:
+                skeleton_lines.append("信息齐了，我可以开始生成行程。")
+            return "\n".join(skeleton_lines)
 
-    def _build_plan_followup_text() -> str:
-        skeleton_lines = [
-            "我可以帮你做行程规划，先补两点关键信息：",
-            "A. 目的地与出发地（若已确定其一可跳过）。",
-            "B. 出行日期与人数。",
-        ]
-        questions = []
-        priorities = [
-            ("目的地", not destination_value),
-            ("出行日期", slots is None or not _valid_date_range(getattr(slots, "date_range", None))),
-            (
-                "同行人数",
-                slots is None
-                or (getattr(slots, "adults", None) is None and getattr(slots, "people_count", None) is None),
-            ),
-            ("出发地", slots is None or not getattr(slots, "origin", None)),
-        ]
-        for label, needed in priorities:
-            if needed:
-                questions.append(label)
-            if len(questions) >= 1:
-                break
-        if questions:
-            skeleton_lines.append(f"先确认：{questions[0]}。")
-        else:
-            skeleton_lines.append("信息齐了，我可以开始生成行程。")
-        return "\n".join(skeleton_lines)
+        actions_routed = False
+        actions_quick_replies: List[str] = []
+        meta = getattr(slots, "meta", None)
+        route_choice = meta.get("route_choice") if isinstance(meta, dict) else None
+        actions_trigger = re.search(r"(几日游|几天|行程|路线|怎么?玩|推荐|攻略|特色|项目|安排)", req.input_text)
+        if actions_trigger and missing_required and not use_dialog_draft_success and not route_choice:
+            archetype = _route_archetype(dest_key, text_merge, region)
+            reply_text, actions_quick_replies = _render_actions_starter(
+                archetype,
+                dest_key,
+                days_guess,
+                origin_value or req.default_origin or req.origin,
+                text=req.input_text,
+            )
+            actions_routed = True
 
-    actions_routed = False
-    actions_quick_replies: List[str] = []
-    actions_trigger = re.search(r"(几日游|几天|行程|路线|怎么?玩|推荐|攻略|特色|项目|安排)", req.input_text)
-    if actions_trigger and missing_required and not use_dialog_draft_success:
-        archetype = _route_archetype(dest_key, text_merge, region)
-        reply_text, actions_quick_replies = _render_actions_starter(
-            archetype,
-            dest_key,
-            days_guess,
-            origin_value or req.default_origin or req.origin,
-            text=req.input_text,
-        )
-        actions_routed = True
-
-    if not actions_routed and not use_dialog_draft_success and _needs_recommendations(req.input_text):
-        if destination_value:
-            if _is_generic_ack(reply_text) or _count_actionable_items(reply_text) < 5:
-                followup = _pick_followup_question(slots, history_with_new_user, user_turns, _guess_days(text_merge))
-                if followup:
-                    qid = _question_id_for_slot(followup["slot_key"])
-                    _record_asked_slot(slots, followup["slot_key"], qid, user_turns)
-                    reply_text = _build_reco_list(destination_value) + "\n\n" + followup["prompt"]
+        if not actions_routed and not use_dialog_draft_success and _needs_recommendations(req.input_text):
+            if destination_value:
+                if _is_generic_ack(reply_text) or _count_actionable_items(reply_text) < 5:
+                    followup = _pick_followup_question(
+                        slots, history_with_new_user, user_turns, _guess_days(text_merge)
+                    )
+                    if followup:
+                        qid = _question_id_for_slot(followup["slot_key"])
+                        _record_asked_slot(slots, followup["slot_key"], qid, user_turns)
+                        reply_text = _build_reco_list(destination_value) + "\n\n" + followup["prompt"]
+                    else:
+                        reply_text = _build_reco_list(destination_value) + "\n\n" + _build_followup_questions(True)
+            else:
+                if intent == "explore" or (intent == "plan" and region):
+                    if region == "东北":
+                        route_menu = _build_route_menu("东北", _guess_days(req.input_text), req.input_text)
+                        menu_text = _render_route_menu_text(route_menu)
+                        if menu_text:
+                            reply_text = menu_text + "\n\n" + "你更想选哪条路线？"
+                        else:
+                            reply_text = _build_region_overview(region)
+                    else:
+                        reply_text = _build_region_overview(region) if region else generic_explore_reply
+                elif intent == "plan":
+                    reply_text = _build_plan_followup_text()
                 else:
-                    reply_text = _build_reco_list(destination_value) + "\n\n" + _build_followup_questions(True)
-        else:
-            if intent == "explore" or (intent == "plan" and region):
+                    reply_text = generic_explore_reply
+        elif not actions_routed and not use_dialog_draft_success and _is_generic_ack(reply_text):
+            if (intent == "explore" or (intent == "plan" and region)) and not destination_value:
                 if region == "东北":
                     route_menu = _build_route_menu("东北", _guess_days(req.input_text), req.input_text)
                     menu_text = _render_route_menu_text(route_menu)
-                    if menu_text:
-                        reply_text = menu_text + "\n\n" + "你更想选哪条路线？"
-                    else:
-                        reply_text = _build_region_overview(region)
+                    reply_text = (
+                        menu_text + "\n\n" + "你更想选哪条路线？" if menu_text else _build_region_overview(region)
+                    )
                 else:
                     reply_text = _build_region_overview(region) if region else generic_explore_reply
             elif intent == "plan":
                 reply_text = _build_plan_followup_text()
-            else:
+            elif not destination_value:
                 reply_text = generic_explore_reply
-    elif not actions_routed and not use_dialog_draft_success and _is_generic_ack(reply_text):
-        if (intent == "explore" or (intent == "plan" and region)) and not destination_value:
-            if region == "东北":
-                route_menu = _build_route_menu("东北", _guess_days(req.input_text), req.input_text)
-                menu_text = _render_route_menu_text(route_menu)
-                reply_text = menu_text + "\n\n" + "你更想选哪条路线？" if menu_text else _build_region_overview(region)
             else:
-                reply_text = _build_region_overview(region) if region else generic_explore_reply
-        elif intent == "plan":
-            reply_text = _build_plan_followup_text()
-        elif not destination_value:
-            reply_text = generic_explore_reply
-        else:
-            followup = _pick_followup_question(slots, history_with_new_user, user_turns, _guess_days(text_merge))
-            if followup:
-                qid = _question_id_for_slot(followup["slot_key"])
-                _record_asked_slot(slots, followup["slot_key"], qid, user_turns)
-                reply_text = followup["prompt"]
+                followup = _pick_followup_question(
+                    slots, history_with_new_user, user_turns, _guess_days(text_merge)
+                )
+                if followup:
+                    qid = _question_id_for_slot(followup["slot_key"])
+                    _record_asked_slot(slots, followup["slot_key"], qid, user_turns)
+                    reply_text = followup["prompt"]
+                else:
+                    reply_text = _build_followup_questions(True)
+
+        # ----- 5) TripPlan 触发条件判断 -----
+        trip_plan_result: Optional[TripPlanResponse] = None
+        missing: List[str] = []
+
+        if should_plan and slots is not None and not use_dialog_draft_success:
+            safe_slots = _fill_defaults(slots)
+            missing = _missing_fields(safe_slots)
+            if not _valid_date_range(getattr(safe_slots, "date_range", None)) and "出行日期" not in missing:
+                missing.append("出行日期")
+            if missing:
+                if not actions_routed:
+                    reply_text = _build_plan_followup_text()
+                trip_plan_result = None
             else:
-                reply_text = _build_followup_questions(True)
+                try:
+                    logger.info("TripChat: calling trip_plan with slots=%s", safe_slots.dict())
+                    trip_plan_result = trip_plan(safe_slots, request)
 
-    # ----- 5) TripPlan 触发条件判断 -----
-    trip_plan_result: Optional[TripPlanResponse] = None
-    missing: List[str] = []
-
-    if should_plan and slots is not None and not use_dialog_draft_success:
-        safe_slots = _fill_defaults(slots)
-        missing = _missing_fields(safe_slots)
-        if not _valid_date_range(getattr(safe_slots, "date_range", None)) and "出行日期" not in missing:
-            missing.append("出行日期")
-        if missing:
+                    if trip_plan_result is not None and date_hint_needed:
+                        msg = "你填写的是节假日/周末范围，如需更精确可补充具体日期"
+                        if trip_plan_result.meta is None:
+                            trip_plan_result.meta = TripPlanMeta(
+                                trace_id=f"tc_{trace_id}",
+                                quality_score=0,
+                                warnings=[msg],
+                                fixed=None,
+                            )
+                        else:
+                            warnings = list(trip_plan_result.meta.warnings or [])
+                            if msg not in warnings:
+                                warnings.insert(0, msg)
+                            trip_plan_result.meta.warnings = warnings[:5]
+                except Exception:
+                    logger.exception("TripChat: error when calling trip_plan")
+                    trip_plan_result = None
+        elif should_plan and not use_dialog_draft_success:
+            missing = ["目的地", "出行日期"]
             if not actions_routed:
                 reply_text = _build_plan_followup_text()
-            trip_plan_result = None
-        else:
-            try:
-                logger.info("TripChat: calling trip_plan with slots=%s", safe_slots.dict())
-                trip_plan_result = trip_plan(safe_slots, request)
 
-                if trip_plan_result is not None and date_hint_needed:
-                    msg = "你填写的是节假日/周末范围，如需更精确可补充具体日期"
-                    if trip_plan_result.meta is None:
-                        trip_plan_result.meta = TripPlanMeta(
-                            trace_id=f"tc_{trace_id}",
-                            quality_score=0,
-                            warnings=[msg],
-                            fixed=None,
-                        )
-                    else:
-                        warnings = list(trip_plan_result.meta.warnings or [])
-                        if msg not in warnings:
-                            warnings.insert(0, msg)
-                        trip_plan_result.meta.warnings = warnings[:5]
-            except Exception:
-                logger.exception("TripChat: error when calling trip_plan")
-                trip_plan_result = None
-    elif should_plan and not use_dialog_draft_success:
-        missing = ["目的地", "出行日期"]
-        if not actions_routed:
-            reply_text = _build_plan_followup_text()
-
-    final_mode = trip_plan_result.mode if trip_plan_result is not None else "no-trip-plan"
-    logger.info(
-        "TripChat trace_id=%s user_text=%s slots.date_range=%s missing_fields=%s final_mode=%s",
-        trace_id,
-        req.input_text,
-        (slots.date_range if slots is not None else None),
-        missing,
-        final_mode,
-    )
-
-    # ----- 6) 根据缺失字段增加“草稿说明”前缀（最多解释一次） -----
-    if trip_plan_result is not None and missing:
-        # 文案互斥：若仍缺“出行日期”，不要在同一回复里出现“已收到日期”等话术
-        if "出行日期" in missing:
-            reply_text = re.sub(r"^.*?(已收到|收到).*(出行)?日期.*?$", "", reply_text, flags=re.MULTILINE).strip()
-
-        draft_phrase = "我先按目前信息出了一个草稿"
-        already_notified = any(
-            (m.role == "assistant" and draft_phrase in (m.content or ""))
-            for m in req.history
+        final_mode = trip_plan_result.mode if trip_plan_result is not None else "no-trip-plan"
+        logger.info(
+            "TripChat trace_id=%s user_text=%s slots.date_range=%s missing_fields=%s final_mode=%s",
+            trace_id,
+            req.input_text,
+            (slots.date_range if slots is not None else None),
+            missing,
+            final_mode,
         )
 
-        missing_text = "、".join(missing)
-        if not already_notified:
-            prefix = f"{draft_phrase}（缺少：{missing_text}），你补充后我再优化。"
-        else:
-            prefix = f"现在还缺：{missing_text}，方便补充一下吗？"
+        # ----- 6) 根据缺失字段增加“草稿说明”前缀（最多解释一次） -----
+        if trip_plan_result is not None and missing:
+            # 文案互斥：若仍缺“出行日期”，不要在同一回复里出现“已收到日期”等话术
+            if "出行日期" in missing:
+                reply_text = re.sub(r"^.*?(已收到|收到).*(出行)?日期.*?$", "", reply_text, flags=re.MULTILINE).strip()
 
-        reply_text = prefix + "\n" + (reply_text or "")
+            draft_phrase = "我先按目前信息出了一个草稿"
+            already_notified = any(
+                (m.role == "assistant" and draft_phrase in (m.content or ""))
+                for m in req.history
+            )
 
-    # QUICK_REPLIES: 若缺少目的地，返回候选给前端渲染 chips
-    quick_replies: List[str] = []
-    try:
-        if slots is None or not getattr(slots, "destination", None):
-            quick_replies = _dest_quick_replies(text_merge)
-    except Exception:
-        quick_replies = []
-
-    resources_out: Dict[str, Any] = resources_from_kb if isinstance(resources_from_kb, dict) else {}
-    if quick_replies:
-        existing = resources_out.setdefault("quick_replies", [])
-        if not isinstance(existing, list):
-            existing = []
-            resources_out["quick_replies"] = existing
-        for item in quick_replies:
-            if item not in existing:
-                existing.append(item)
-    if suggested_quick_replies:
-        existing = resources_out.setdefault("quick_replies", [])
-        if not isinstance(existing, list):
-            existing = []
-            resources_out["quick_replies"] = existing
-        for item in suggested_quick_replies:
-            if item not in existing:
-                existing.append(item)
-    if actions_quick_replies:
-        existing = resources_out.setdefault("quick_replies", [])
-        if not isinstance(existing, list):
-            existing = []
-            resources_out["quick_replies"] = existing
-        for item in actions_quick_replies:
-            if item not in existing:
-                existing.append(item)
-    if use_dialog_draft_success and dialog_quick_replies:
-        existing = resources_out.setdefault("quick_replies", [])
-        if not isinstance(existing, list):
-            existing = []
-            resources_out["quick_replies"] = existing
-        for item in dialog_quick_replies:
-            if item not in existing:
-                existing.append(item)
-        resources_out["quick_replies"] = existing[:12]
-    if region == "东北" and intent == "explore" and not use_dialog_draft_success:
-        menu_replies = ["选A", "选B", "选C", "我不确定"]
-        existing = resources_out.setdefault("quick_replies", [])
-        if not isinstance(existing, list):
-            existing = []
-            resources_out["quick_replies"] = existing
-        for item in menu_replies:
-            if item not in existing:
-                existing.append(item)
-    if origin_conflict_note and getattr(slots, "origin", None) and req.origin:
-        conflict_replies = [f"以{slots.origin}出发", f"改为{req.origin}出发"]
-        existing = resources_out.setdefault("quick_replies", [])
-        if not isinstance(existing, list):
-            existing = []
-            resources_out["quick_replies"] = existing
-        for item in conflict_replies:
-            if item not in existing:
-                existing.append(item)
-    if use_dialog_draft_success:
-        existing = resources_out.get("quick_replies")
-        if isinstance(existing, list):
-            resources_out["quick_replies"] = existing[:12]
-
-    # ----- 8) 组装响应：resources_from_kb 和 trip_plan 一起返回 -----
-    slot_completeness = SlotCompleteness(
-        required_done=_estimate_required_done(slots),
-        required_total=4,
-    )
-    has_trip_plan = trip_plan_result is not None
-    if refine_intent and has_trip_plan:
-        logger.info("refine_triggered trace_id=%s turn=%s", trace_id, user_turns)
-    if refine_intent and has_trip_plan:
-        dialog_state = DialogState.REFINEMENT
-    elif has_trip_plan:
-        dialog_state = DialogState.PLAN_PRESENTED
-    elif missing_required:
-        dialog_state = DialogState.DISCOVERY
-    else:
-        dialog_state = DialogState.PLAN_DRAFTING
-
-    next_action = NextAction(type="NONE", reason="not_plan")
-    pending_questions: List[PendingQuestion] = []
-    if refine_intent and has_trip_plan:
-        next_action = NextAction(type="REFINE_PLAN", reason="user_refine")
-    elif should_plan and not actions_routed and not use_dialog_draft_success:
-        ask_key = None
-        for key in missing_required:
-            if _should_ask(key, slots, history_with_new_user, user_turns, days_guess):
-                ask_key = key
-                break
-        if ask_key is None:
-            if not missing_required:
-                next_action = NextAction(type="CALL_TRIP_PLAN", reason="required_complete")
+            missing_text = "、".join(missing)
+            if not already_notified:
+                prefix = f"{draft_phrase}（缺少：{missing_text}），你补充后我再优化。"
             else:
-                next_action = NextAction(type="NONE", reason="asked_recently")
-                logger.warning(
-                    "repeat_question_detected trace_id=%s turn=%s missing_required=%s",
-                    trace_id,
-                    user_turns,
-                    ",".join(missing_required),
-                )
-        else:
-            next_action = NextAction(type="ASK", reason=f"missing_{ask_key}")
-            pending_questions = [_build_pending_question(ask_key)]
-            _record_asked_slot(slots, ask_key, pending_questions[0].question_id, user_turns)
-    trip_profile = _build_trip_profile(slots)
-    if has_trip_plan:
-        meta = getattr(slots, "meta", None) if slots is not None else None
-        if not isinstance(meta, dict) or meta.get("first_plan_turn") is None:
-            _set_meta_value(slots, "first_plan_turn", user_turns)
-            logger.info("turns_to_first_plan trace_id=%s turn=%s", trace_id, user_turns)
-    if actions_routed or use_dialog_draft_success:
-        next_action = NextAction(type="NONE", reason="actions_template")
-        pending_questions = []
-    if (
-        not actions_routed
-        and not use_dialog_draft_success
-        and should_plan
-        and next_action.type in {"ASK", "CALL_TRIP_PLAN", "REFINE_PLAN"}
-    ):
-        reply_text = _render_reply(
-            slots,
-            next_action,
-            pending_questions,
-            days_guess,
-            has_user_origin,
-            origin_conflict_note,
-        )
-    elif origin_conflict_note:
-        reply_text = origin_conflict_note + ("\n" + reply_text if reply_text else "")
-    mode = _detect_mode(req.input_text, has_trip_plan)
+                prefix = f"现在还缺：{missing_text}，方便补充一下吗？"
 
-    # ----- 防止内部 spots-json 泄漏到前端 -----
-    if _looks_like_spots_json(reply_text):
+            reply_text = prefix + "\n" + (reply_text or "")
+
+        # QUICK_REPLIES: 若缺少目的地，返回候选给前端渲染 chips
+        quick_replies: List[str] = []
         try:
-            obj = json.loads(reply_text)
+            if slots is None or not getattr(slots, "destination", None):
+                quick_replies = _dest_quick_replies(text_merge)
         except Exception:
-            obj = None
-        dest = getattr(slots, "destination", None) if slots is not None else (req.destination or "")
-        if isinstance(obj, dict) and dest:
-            reply_text = _render_spots_json_to_user(obj, dest)
-        else:
-            reply_text = ""
+            quick_replies = []
 
-    reply_text = _enforce_v1_actions_style(reply_text)
-    final_reply = reply_text or "这边现在有点忙，你可以稍后再试试。"
-    final_history = history_with_new_user + [ChatMessage(role="assistant", content=final_reply)]
-    if final_history and final_history[-1].role == "assistant" and final_history[-1].content != final_reply:
-        logger.error("history_reply_mismatch trace_id=%s", trace_id)
-    return TripChatResponse(
-        reply=final_reply,
-        history=final_history,
-        slots=slots,
-        trip_plan=trip_plan_result,
-        resources=resources_out,
-        mode=mode,
-        dialog_state=dialog_state,
-        slot_completeness=slot_completeness,
-        pending_questions=pending_questions,
-        next_action=next_action,
-        trip_profile=trip_profile,
-    )
+        resources_out: Dict[str, Any] = resources_from_kb if isinstance(resources_from_kb, dict) else {}
+        if quick_replies:
+            existing = resources_out.setdefault("quick_replies", [])
+            if not isinstance(existing, list):
+                existing = []
+                resources_out["quick_replies"] = existing
+            for item in quick_replies:
+                if item not in existing:
+                    existing.append(item)
+        if suggested_quick_replies:
+            existing = resources_out.setdefault("quick_replies", [])
+            if not isinstance(existing, list):
+                existing = []
+                resources_out["quick_replies"] = existing
+            for item in suggested_quick_replies:
+                if item not in existing:
+                    existing.append(item)
+        if actions_quick_replies:
+            existing = resources_out.setdefault("quick_replies", [])
+            if not isinstance(existing, list):
+                existing = []
+                resources_out["quick_replies"] = existing
+            for item in actions_quick_replies:
+                if item not in existing:
+                    existing.append(item)
+        if use_dialog_draft_success and dialog_quick_replies:
+            existing = resources_out.setdefault("quick_replies", [])
+            if not isinstance(existing, list):
+                existing = []
+                resources_out["quick_replies"] = existing
+            for item in dialog_quick_replies:
+                if item not in existing:
+                    existing.append(item)
+            resources_out["quick_replies"] = existing[:12]
+        if region == "东北" and intent == "explore" and not use_dialog_draft_success and not route_choice:
+            menu_replies = ["选A", "选B", "选C", "我不确定"]
+            existing = resources_out.setdefault("quick_replies", [])
+            if not isinstance(existing, list):
+                existing = []
+                resources_out["quick_replies"] = existing
+            for item in menu_replies:
+                if item not in existing:
+                    existing.append(item)
+        if origin_conflict_note and getattr(slots, "origin", None) and req.origin:
+            conflict_replies = [f"以{slots.origin}出发", f"改为{req.origin}出发"]
+            existing = resources_out.setdefault("quick_replies", [])
+            if not isinstance(existing, list):
+                existing = []
+                resources_out["quick_replies"] = existing
+            for item in conflict_replies:
+                if item not in existing:
+                    existing.append(item)
+        if use_dialog_draft_success:
+            existing = resources_out.get("quick_replies")
+            if isinstance(existing, list):
+                resources_out["quick_replies"] = existing[:12]
+
+        # ----- 8) 组装响应：resources_from_kb 和 trip_plan 一起返回 -----
+        slot_completeness = SlotCompleteness(
+            required_done=_estimate_required_done(slots),
+            required_total=4,
+        )
+        has_trip_plan = trip_plan_result is not None
+        if refine_intent and has_trip_plan:
+            logger.info("refine_triggered trace_id=%s turn=%s", trace_id, user_turns)
+        if refine_intent and has_trip_plan:
+            dialog_state = DialogState.REFINEMENT
+        elif has_trip_plan:
+            dialog_state = DialogState.PLAN_PRESENTED
+        elif missing_required:
+            dialog_state = DialogState.DISCOVERY
+        else:
+            dialog_state = DialogState.PLAN_DRAFTING
+
+        next_action = NextAction(type="NONE", reason="not_plan")
+        pending_questions: List[PendingQuestion] = []
+        if refine_intent and has_trip_plan:
+            next_action = NextAction(type="REFINE_PLAN", reason="user_refine")
+        elif should_plan and not actions_routed and not use_dialog_draft_success:
+            ask_key = None
+            for key in missing_required:
+                if _should_ask(key, slots, history_with_new_user, user_turns, days_guess):
+                    ask_key = key
+                    break
+            if ask_key is None:
+                if not missing_required:
+                    next_action = NextAction(type="CALL_TRIP_PLAN", reason="required_complete")
+                else:
+                    next_action = NextAction(type="NONE", reason="asked_recently")
+                    logger.warning(
+                        "repeat_question_detected trace_id=%s turn=%s missing_required=%s",
+                        trace_id,
+                        user_turns,
+                        ",".join(missing_required),
+                    )
+            else:
+                next_action = NextAction(type="ASK", reason=f"missing_{ask_key}")
+                pending_questions = [_build_pending_question(ask_key)]
+                _record_asked_slot(slots, ask_key, pending_questions[0].question_id, user_turns)
+        trip_profile = _build_trip_profile(slots)
+        if has_trip_plan:
+            meta = getattr(slots, "meta", None) if slots is not None else None
+            if not isinstance(meta, dict) or meta.get("first_plan_turn") is None:
+                _set_meta_value(slots, "first_plan_turn", user_turns)
+                logger.info("turns_to_first_plan trace_id=%s turn=%s", trace_id, user_turns)
+        if actions_routed or use_dialog_draft_success:
+            next_action = NextAction(type="NONE", reason="actions_template")
+            pending_questions = []
+        if (
+            not actions_routed
+            and not use_dialog_draft_success
+            and should_plan
+            and next_action.type in {"ASK", "CALL_TRIP_PLAN", "REFINE_PLAN"}
+        ):
+            reply_text = _render_reply(
+                slots,
+                next_action,
+                pending_questions,
+                days_guess,
+                has_user_origin,
+                origin_conflict_note,
+            )
+        elif origin_conflict_note:
+            reply_text = origin_conflict_note + ("\n" + reply_text if reply_text else "")
+        mode = _detect_mode(req.input_text, has_trip_plan)
+
+        if mode == "EXPLORE" and dialog_state == DialogState.DISCOVERY:
+            reply_text = _normalize_trip_reply(reply_text, mode)
+
+        # ----- 防止内部 spots-json 泄漏到前端 -----
+        if _looks_like_spots_json(reply_text):
+            try:
+                obj = json.loads(reply_text)
+            except Exception:
+                obj = None
+            dest = getattr(slots, "destination", None) if slots is not None else (req.destination or "")
+            if isinstance(obj, dict) and dest:
+                reply_text = _render_spots_json_to_user(obj, dest)
+            else:
+                reply_text = ""
+
+        reply_text = _enforce_v1_actions_style(reply_text)
+        final_reply = reply_text or "这边现在有点忙，你可以稍后再试试。"
+        final_history = history_with_new_user + [ChatMessage(role="assistant", content=final_reply)]
+        if final_history and final_history[-1].role == "assistant" and final_history[-1].content != final_reply:
+            logger.error("history_reply_mismatch trace_id=%s", trace_id)
+        return TripChatResponse(
+            reply=final_reply,
+            history=final_history,
+            slots=slots,
+            trip_plan=trip_plan_result,
+            resources=resources_out,
+            mode=mode,
+            dialog_state=dialog_state,
+            slot_completeness=slot_completeness,
+            pending_questions=pending_questions,
+            next_action=next_action,
+            trip_profile=trip_profile,
+        )
+    except Exception as exc:
+        logger.exception("TripChat unhandled error trace_id=%s", trace_id)
+        fallback_text = "系统刚刚开小差了…请再试一次。"
+        history_out = list(req.history or [])
+        if not history_out:
+            history_out = [ChatMessage(role="user", content=req.input_text)]
+        else:
+            last = history_out[-1]
+            same_user = (
+                last.role == "user" and (last.content or "").strip() == (req.input_text or "").strip()
+            )
+            if not same_user:
+                history_out.append(ChatMessage(role="user", content=req.input_text))
+        history_out.append(ChatMessage(role="assistant", content=fallback_text))
+        return TripChatResponse(
+            reply=fallback_text,
+            history=history_out,
+            slots=req.current_slots,
+            trip_plan=None,
+            resources=None,
+            mode="EXPLORE",
+            dialog_state=DialogState.DISCOVERY,
+            slot_completeness=SlotCompleteness(required_done=0, required_total=4),
+            pending_questions=[],
+            next_action=NextAction(type="NONE", reason="exception"),
+            trip_profile=_build_trip_profile(req.current_slots),
+            meta={"trace_id": trace_id},
+        )
